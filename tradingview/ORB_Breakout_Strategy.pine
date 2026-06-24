@@ -1,4 +1,4 @@
-// Opening Range Breakout — 1m close above/below OR, stop opposite side, fixed sizing
+// Opening Range Breakout — OR stop, BE at 2R, FVG invalidation TP, opp FVG exit before 1R
 //@version=5
 strategy("MNQ ORB Breakout", overlay=true, max_boxes_count=50, max_lines_count=50,
      initial_capital=50000, currency=currency.USD,
@@ -13,11 +13,19 @@ useOrbShort = input.bool(true, "ORB Short (break + close below OR low)", group=g
 
 // ── Opening range ────────────────────────────────────────────────────────────
 grpOr = "Opening Range"
-rthSession   = input.session("0930-1600", "US RTH Session (ET)", group=grpOr)
-orSession    = input.session("0930-0931", "OR Candle (1m)", group=grpOr)
-tradeSession = input.session("0931-1600", "Entry Window", group=grpOr)
+rthSession   = input.session("0930-1600:23456", "US RTH Session (ET)", group=grpOr)
+orSession    = input.session("0930-0931:23456", "OR Candle (1m)", group=grpOr)
+tradeSession = input.session("0931-1600:23456", "Entry Window", group=grpOr)
 tz           = input.string("America/New_York", "Session Timezone", group=grpOr)
 flatAtClose  = input.bool(true, "Close All Positions at RTH End", group=grpOr)
+skipUsHolidays = input.bool(true, "Skip US Market Holidays", group=grpOr,
+     tooltip="No opening range or entries on NYSE/CME full-day closures (incl. Juneteenth).")
+useEntryCutoff = input.bool(true, "Stop New Entries After Cutoff", group=grpOr,
+     tooltip="Off = entries allowed until 4 PM ET. On = no new trades after cutoff (default noon CT).")
+entryCutoffTz  = input.string("America/Chicago", "Entry Cutoff Timezone", group=grpOr)
+entryCutoffH   = input.int(12, "Entry Cutoff Hour (24h)", minval=8, maxval=16, group=grpOr)
+entryCutoffM   = input.int(0, "Entry Cutoff Minute", minval=0, maxval=59, group=grpOr,
+     tooltip="Default 12:00 = noon CT (1:00 PM ET). Last entry on the bar before cutoff.")
 
 // ── Orders ───────────────────────────────────────────────────────────────────
 grpExec = "Orders"
@@ -26,31 +34,70 @@ entryBufferTicks = input.int(1, "Entry Buffer Beyond OR (ticks)", minval=0, grou
 stopBufferTicks  = input.int(1, "Stop Buffer Beyond OR (ticks)", minval=0, group=grpExec,
      tooltip="Long: stop below OR low. Short: stop above OR high.")
 tickSize         = input.float(0.25, "Tick Size", minval=0.01, group=grpExec)
-rr               = input.float(2.0, "Take Profit (R multiple)", minval=0.1, step=0.1, group=grpExec)
+beAtR            = input.float(2.0, "Move Stop to BE at (R multiple)", minval=0.1, step=0.1, group=grpExec)
 oneTradePerDay   = input.bool(false, "One ORB Trade Per Direction / Day", group=grpExec)
 requireOrReset   = input.bool(true, "Require Close Back Inside OR Before Re-Entry", group=grpExec,
      tooltip="Long: prior close at/below OR high. Short: prior close at/above OR low.")
 
+// ── FVG exits (1m) ───────────────────────────────────────────────────────────
+grpFvg = "FVG Exits (1m)"
+fvgMinGap   = input.float(0.0, "Min FVG Size (points)", minval=0, step=0.25, group=grpFvg,
+     tooltip="Minimum 3-candle gap size to count as an FVG.")
+oppFvgMinR  = input.float(1.0, "Opposite FVG Exit Below (R)", minval=0.1, step=0.1, group=grpFvg,
+     tooltip="If trade has not reached this R, exit when an opposite-direction FVG forms.")
+
 // ── Position sizing ──────────────────────────────────────────────────────────
 grpRisk = "Position Sizing"
-pointValue     = input.float(2.0, "Point Value ($)", minval=0.01, group=grpRisk)
-idealContracts = input.int(2, "Ideal Contracts", minval=1, group=grpRisk,
-     tooltip="Use this many contracts when total risk stays at or below max risk.")
-maxRisk        = input.float(300.0, "Max Total Risk for Ideal Size ($)", minval=1, group=grpRisk,
-     tooltip="If ideal size would exceed this, trade 1 contract instead — even if that one contract risks more than this.")
-maxContracts   = input.int(5, "Max Contracts", minval=1, group=grpRisk)
-minStopTicks   = input.int(1, "Min Stop Distance (ticks)", minval=1, group=grpRisk)
+tradeQty   = input.int(3, "Contracts", minval=1, group=grpRisk)
+pointValue = input.float(2.0, "Point Value ($)", minval=0.01, group=grpRisk,
+     tooltip="Used for exit PnL labels only.")
 
 // ── Visuals ──────────────────────────────────────────────────────────────────
 grpVis = "Visuals"
 showOrBox = input.bool(true, "Draw OR Box", group=grpVis)
 
 // ── Session / OR ─────────────────────────────────────────────────────────────
+// NYSE/CME full-day closures (YYYYMMDD). Observed dates when holiday falls on a weekend.
+var int[] usMarketHolidays = array.from(
+     20240101, 20240115, 20240219, 20240329, 20240527, 20240619, 20240704, 20240902, 20241128, 20241225,
+     20250101, 20250120, 20250217, 20250418, 20250526, 20250619, 20250704, 20250901, 20251127, 20251225,
+     20260101, 20260119, 20260216, 20260403, 20260525, 20260619, 20260703, 20260907, 20261126, 20261225,
+     20270101, 20270118, 20270215, 20270326, 20270531, 20270618, 20270705, 20270906, 20271125, 20271224)
+
+isUsHoliday(int ymd) =>
+    skipUsHolidays and array.includes(usMarketHolidays, ymd)
+
+barDateKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+dow        = dayofweek(time, tz)
+isWeekday  = dow != dayofweek.saturday and dow != dayofweek.sunday
+isTradingDay = isWeekday and not isUsHoliday(barDateKey)
+
 inRth      = not na(time(timeframe.period, rthSession, tz))
 inOrBar    = not na(time(timeframe.period, orSession, tz))
 inTradeWin = not na(time(timeframe.period, tradeSession, tz))
 newDay     = ta.change(time("D", tz))
 rthEnded   = inRth[1] and not inRth
+
+// Hard clock guard — session strings alone can miss ETH bars on MNQ
+barMins      = hour(time, tz) * 60 + minute(time, tz)
+inRthClock   = barMins >= 9 * 60 + 30 and barMins < 16 * 60
+inEntryClock = barMins >= 9 * 60 + 31 and barMins < 16 * 60
+cutoffBarMins  = hour(time, entryCutoffTz) * 60 + minute(time, entryCutoffTz)
+cutoffMins     = entryCutoffH * 60 + entryCutoffM
+inEntryCutoff  = not useEntryCutoff or cutoffBarMins < cutoffMins
+
+var bool entriesLocked = false
+
+if bool(newDay)
+    entriesLocked := false
+
+// Only lock after a real RTH close on a trading day (not holiday ETH artifacts)
+if rthEnded and isTradingDay[1]
+    entriesLocked := true
+
+// Unlock when RTH opens on a new trading day (handles weekend/holiday bar gaps)
+if isTradingDay and inRth and not inRth[1]
+    entriesLocked := false
 
 var float orHigh  = na
 var float orLow   = na
@@ -61,11 +108,11 @@ if bool(newDay)
     orLow   := na
     orReady := false
 
-if inOrBar
+if inOrBar and isTradingDay
     orHigh := high
     orLow  := low
 
-if inOrBar[1] and not inOrBar
+if inOrBar[1] and not inOrBar and isTradingDay
     orReady := true
 
 entryBuffer = entryBufferTicks * tickSize
@@ -76,20 +123,34 @@ longStop   = orReady and not na(orLow)  ? orLow - stopBuffer : na
 shortEntry = orReady and not na(orLow)  ? orLow - entryBuffer : na
 shortStop  = orReady and not na(orHigh) ? orHigh + stopBuffer : na
 
-calcQty(float entry, float stop) =>
-    riskPts = math.abs(entry - stop)
-    minStop = minStopTicks * tickSize
-    qty = 0
-    if riskPts >= minStop
-        rpc = riskPts * pointValue
-        if rpc > 0
-            idealQty = math.min(idealContracts, maxContracts)
-            qty := idealQty * rpc <= maxRisk ? idealQty : 1
-    qty
+// ── 1m FVG detection ─────────────────────────────────────────────────────────
+bullFvgRaw = low > high[2] and low - high[2] >= fvgMinGap
+bearFvgRaw = high < low[2] and low[2] - high >= fvgMinGap
+bullFvgTop = low
+bullFvgBot = high[2]
+bearFvgTop = low[2]
+bearFvgBot = high
 
-// ── Breakout + reset state ───────────────────────────────────────────────────
-var bool longTakenToday  = false
-var bool shortTakenToday = false
+formatExitComment(string exitName, float exitPrice, float initR) =>
+    qty = math.abs(strategy.position_size)
+    dir = strategy.position_size > 0 ? 1.0 : -1.0
+    pts = (exitPrice - strategy.position_avg_price) * dir
+    rr  = initR > 0 ? pts / initR : 0.0
+    net = qty * pts * pointValue - qty * 0.62 * 2.0
+    sign = net >= 0 ? "+$" : "-$"
+    rrStr = (rr >= 0 ? "+" : "") + str.tostring(rr, "#.##") + "R"
+    exitName + " (" + sign + str.tostring(math.abs(net), "#.##") + ", " + rrStr + ")"
+
+// ── Breakout + trade state ───────────────────────────────────────────────────
+var bool  longTakenToday   = false
+var bool  shortTakenToday  = false
+var bool  tradeBeArmed     = false
+var bool  tradeHit1R       = false
+var float tradeInitialStop = na
+var float tradeStop        = na
+var float tradeFvgLevel    = na
+var int   tradeFvgBar      = na
+var int   tradeEntryBar    = na
 
 if bool(newDay)
     longTakenToday  := false
@@ -98,35 +159,107 @@ if bool(newDay)
 longResetOk  = not requireOrReset or close[1] <= orHigh
 shortResetOk = not requireOrReset or close[1] >= orLow
 
-longBreakout  = orReady and high > orHigh and close > orHigh and longResetOk
-shortBreakout = orReady and low < orLow and close < orLow and shortResetOk
+longBreakout  = isTradingDay and orReady and inEntryClock and inEntryCutoff and not entriesLocked and high > orHigh and close > orHigh and longResetOk
+shortBreakout = isTradingDay and orReady and inEntryClock and inEntryCutoff and not entriesLocked and low < orLow and close < orLow and shortResetOk
 
-canEnter = orReady and inRth and inTradeWin and strategy.position_size == 0
+canEnter = isTradingDay and orReady and inRth and inTradeWin and inRthClock and inEntryClock and inEntryCutoff and not entriesLocked and strategy.position_size == 0
 
-longRisk    = longEntry - longStop
-shortRisk   = shortStop - shortEntry
-longTarget  = longEntry + longRisk * rr
-shortTarget = shortEntry - shortRisk * rr
-longQty     = calcQty(longEntry, longStop)
-shortQty    = calcQty(shortEntry, shortStop)
-
-longOk = useOrbLong and canEnter and longBreakout and longQty > 0 and longStop < longEntry and
+longOk = useOrbLong and canEnter and longBreakout and longStop < longEntry and
      (not oneTradePerDay or not longTakenToday)
-shortOk = useOrbShort and canEnter and shortBreakout and shortQty > 0 and shortStop > shortEntry and
+shortOk = useOrbShort and canEnter and shortBreakout and shortStop > shortEntry and
      (not oneTradePerDay or not shortTakenToday)
 
+// ── Exit management ──────────────────────────────────────────────────────────
+if strategy.position_size > 0 and not na(tradeInitialStop) and bar_index > tradeEntryBar
+    entryPx = strategy.position_avg_price
+    initR   = entryPx - tradeInitialStop
+    minRPx  = entryPx + initR * oppFvgMinR
+    bePx    = entryPx + initR * beAtR
+
+    if initR > 0 and high >= minRPx
+        tradeHit1R := true
+
+    if not tradeBeArmed and initR > 0 and high >= bePx
+        tradeBeArmed := true
+        tradeStop := math.max(tradeStop, entryPx)
+
+    if tradeBeArmed and bullFvgRaw and bar_index > tradeEntryBar
+        tradeFvgLevel := bullFvgBot
+        tradeFvgBar   := bar_index
+
+    bullFvgInvalidClose = tradeBeArmed and not na(tradeFvgLevel) and not na(tradeFvgBar) and bar_index > tradeFvgBar and close < open and close < tradeFvgLevel
+
+    if not tradeHit1R and bearFvgRaw and bar_index > tradeEntryBar
+        strategy.close("ORB Long", comment=formatExitComment("ORB Long Opp FVG Exit", close, initR))
+    else if bullFvgInvalidClose
+        strategy.close("ORB Long", comment=formatExitComment("ORB Long FVG TP", close, initR))
+    else if low <= tradeStop
+        strategy.close("ORB Long", comment=formatExitComment(tradeBeArmed ? "ORB Long BE Stop" : "ORB Long Stop", tradeStop, initR))
+
+if strategy.position_size < 0 and not na(tradeInitialStop) and bar_index > tradeEntryBar
+    entryPx = strategy.position_avg_price
+    initR   = tradeInitialStop - entryPx
+    minRPx  = entryPx - initR * oppFvgMinR
+    bePx    = entryPx - initR * beAtR
+
+    if initR > 0 and low <= minRPx
+        tradeHit1R := true
+
+    if not tradeBeArmed and initR > 0 and low <= bePx
+        tradeBeArmed := true
+        tradeStop := math.min(tradeStop, entryPx)
+
+    if tradeBeArmed and bearFvgRaw and bar_index > tradeEntryBar
+        tradeFvgLevel := bearFvgTop
+        tradeFvgBar   := bar_index
+
+    bearFvgInvalidClose = tradeBeArmed and not na(tradeFvgLevel) and not na(tradeFvgBar) and bar_index > tradeFvgBar and close > open and close > tradeFvgLevel
+
+    if not tradeHit1R and bullFvgRaw and bar_index > tradeEntryBar
+        strategy.close("ORB Short", comment=formatExitComment("ORB Short Opp FVG Exit", close, initR))
+    else if bearFvgInvalidClose
+        strategy.close("ORB Short", comment=formatExitComment("ORB Short FVG TP", close, initR))
+    else if high >= tradeStop
+        strategy.close("ORB Short", comment=formatExitComment(tradeBeArmed ? "ORB Short BE Stop" : "ORB Short Stop", tradeStop, initR))
+
 if flatAtClose and rthEnded and strategy.position_size != 0
-    strategy.close_all(comment="US RTH close")
+    if strategy.position_size > 0
+        initR = strategy.position_avg_price - tradeInitialStop
+        strategy.close("ORB Long", comment=formatExitComment("ORB Long RTH Close", close, initR))
+    else
+        initR = tradeInitialStop - strategy.position_avg_price
+        strategy.close("ORB Short", comment=formatExitComment("ORB Short RTH Close", close, initR))
 
 if longOk
-    strategy.entry("ORB Long", strategy.long, qty=longQty, alert_message="ORB long")
-    strategy.exit("ORB Long Exit", "ORB Long", stop=longStop, limit=longTarget)
-    longTakenToday := true
+    strategy.entry("ORB Long", strategy.long, qty=tradeQty, alert_message="ORB long")
+    tradeBeArmed     := false
+    tradeHit1R       := false
+    tradeFvgLevel    := na
+    tradeFvgBar      := na
+    tradeInitialStop := longStop
+    tradeStop        := longStop
+    tradeEntryBar    := bar_index
+    longTakenToday   := true
 
 if shortOk
-    strategy.entry("ORB Short", strategy.short, qty=shortQty, alert_message="ORB short")
-    strategy.exit("ORB Short Exit", "ORB Short", stop=shortStop, limit=shortTarget)
-    shortTakenToday := true
+    strategy.entry("ORB Short", strategy.short, qty=tradeQty, alert_message="ORB short")
+    tradeBeArmed     := false
+    tradeHit1R       := false
+    tradeFvgLevel    := na
+    tradeFvgBar      := na
+    tradeInitialStop := shortStop
+    tradeStop        := shortStop
+    tradeEntryBar    := bar_index
+    shortTakenToday  := true
+
+if strategy.position_size == 0 and not longOk and not shortOk
+    tradeBeArmed     := false
+    tradeHit1R       := false
+    tradeInitialStop := na
+    tradeStop        := na
+    tradeFvgLevel    := na
+    tradeFvgBar      := na
+    tradeEntryBar    := na
 
 // ── Visuals (RTH only) ───────────────────────────────────────────────────────
 var box orBox     = na
