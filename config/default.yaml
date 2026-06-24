@@ -1,0 +1,41 @@
+symbol: NQ=F
+interval: 5m
+period: 60d
+
+contract:
+  point_value: 2.0
+  tick_size: 0.25
+  commission_per_side: 0.62
+  slippage_ticks: 1
+
+fvg:
+  min_gap_points: 8.0
+  max_age_bars: 24
+
+strategy:
+  entry_mode: edge
+  require_trend: true
+  require_trend_at_entry: true
+  trend_ema_period: 50
+  trade_bullish: true
+  trade_bearish: true
+  one_trade_at_a_time: true
+  stop_buffer_ticks: 2
+  risk_reward: 1.5
+  min_stop_points: 20.0
+  require_rejection: true
+  displacement:
+    enabled: true
+    atr_period: 14
+    min_body_ratio: 0.6
+    min_atr_multiple: 1.5
+  session:
+    enabled: true
+    start: "09:30"
+    end: "11:30"
+    timezone: America/New_York
+
+backtest:
+  initial_capital: 50000
+  risk_per_trade_pct: 1.0
+  max_contracts: 5

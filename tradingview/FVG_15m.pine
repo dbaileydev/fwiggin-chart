@@ -1,0 +1,177 @@
+// 15-Minute Fair Value Gaps — native 15m or 5m chart (via HTF)
+//
+// SETUP: Pine Editor → New → Blank indicator → paste ALL of this file
+//
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+//@version=5
+indicator("15m FVG", shorttitle="15m FVG", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpDet = "Detection"
+FVG_TF     = "15"
+minGap     = input.float(0.0, "Min Gap Size (points)", minval=0, step=0.25, group=grpDet)
+showBull   = input.bool(true, "Bullish FVGs", group=grpDet)
+showBear   = input.bool(true, "Bearish FVGs", group=grpDet)
+mitigateOn = input.string("Wick", "Remove When", options=["Wick", "Close"], group=grpDet)
+
+grpSess = "Session Window"
+tz                = input.string("America/New_York", "Timezone", group=grpSess)
+tradingDaysToShow = input.int(2, "Trading Days to Show", minval=1, maxval=5, tooltip="2 = current CME session + prior trading day.", group=grpSess)
+includeOvernight  = input.bool(true, "Include Overnight / Globex", group=grpSess)
+rthStartH         = input.int(9, "RTH Start Hour", minval=0, maxval=23, group=grpSess)
+rthStartM         = input.int(30, "RTH Start Minute", minval=0, maxval=59, group=grpSess)
+rthEndH           = input.int(16, "RTH End Hour", minval=0, maxval=23, group=grpSess)
+rthEndM           = input.int(0, "RTH End Minute", minval=0, maxval=59, group=grpSess)
+
+grpVis = "Style"
+bullFill  = input.color(color.new(#b2dfdb, 70), "Bullish Fill", group=grpVis)
+bearFill  = input.color(color.new(#ffcdd2, 70), "Bearish Fill", group=grpVis)
+bullBorder = input.color(color.new(#00897b, 40), "Bullish Border", group=grpVis)
+bearBorder = input.color(color.new(#c62828, 40), "Bearish Border", group=grpVis)
+ceColor   = input.color(color.new(color.black, 0), "CE Midline", group=grpVis)
+showCE    = input.bool(true, "Show 50% CE Line", group=grpVis)
+extendRight = input.bool(true, "Extend FVG Right", group=grpVis)
+
+MS_DAY = 86400000
+refTime = time
+
+// ── CME session window ───────────────────────────────────────────────────────
+cmeSessionStart(int t) =>
+    y  = year(t, tz)
+    mo = month(t, tz)
+    d  = dayofmonth(t, tz)
+    h  = hour(t, tz)
+    evening = timestamp(tz, y, mo, d, 18, 0)
+    h >= 18 ? evening : evening - MS_DAY
+
+isWeekday(int t) =>
+    dow = dayofweek(t, tz)
+    dow >= dayofweek.monday and dow <= dayofweek.friday
+
+oldestSessionStart(int sessions) =>
+    int oldest   = cmeSessionStart(refTime)
+    int lastSeen = oldest
+    int found    = 1
+    int probe    = refTime
+    if sessions > 1
+        for i = 1 to 14
+            if found >= sessions
+                break
+            probe -= MS_DAY
+            if isWeekday(probe)
+                int ss = cmeSessionStart(probe)
+                if ss != lastSeen
+                    oldest   := ss
+                    lastSeen := ss
+                    found    += 1
+    oldest
+
+oldestStart = oldestSessionStart(tradingDaysToShow)
+
+inTradingWindow(int formT) =>
+    formT >= oldestStart and formT <= refTime
+
+rthStartMin = rthStartH * 60 + rthStartM
+rthEndMin   = rthEndH * 60 + rthEndM
+
+inRthOnly(int formT) =>
+    barMin = hour(formT, tz) * 60 + minute(formT, tz)
+    barMin >= rthStartMin and barMin <= rthEndMin
+
+fvgVisible(int formT) =>
+    inTradingWindow(formT) and (includeOvernight or inRthOnly(formT))
+
+// ── 15m FVG detection + invalidation OHLC (always from 15m) ─────────────────
+fvgPack() =>
+    bull = low - high[2] > minGap
+    bear = low[2] - high > minGap
+    [bull, bear, low, high[2], low[2], high, time[2], time, high, low, close]
+
+[bSec, beSec, bTopSec, bBotSec, sTopSec, sBotSec, tLeftSec, tFormSec, invH, invL, invC] = request.security(
+     syminfo.tickerid, FVG_TF, fvgPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+onNativeTf = timeframe.period == FVG_TF
+
+bullGap = onNativeTf ? low - high[2] > minGap : bSec
+bearGap = onNativeTf ? low[2] - high > minGap : beSec
+bTop    = onNativeTf ? low : bTopSec
+bBot    = onNativeTf ? high[2] : bBotSec
+sTop    = onNativeTf ? low[2] : sTopSec
+sBot    = onNativeTf ? high : sBotSec
+tLeft   = onNativeTf ? time[2] : tLeftSec
+tForm   = onNativeTf ? time : tFormSec
+
+// Same 15m close event on both 5m and 15m charts
+htfBarClosed = ta.change(tForm) != 0
+
+bullNew = htfBarClosed and bullGap
+bearNew = htfBarClosed and bearGap
+
+// ── Storage ──────────────────────────────────────────────────────────────────
+var box[]   boxes     = array.new_box()
+var line[]  ceLines   = array.new_line()
+var float[] tops      = array.new_float()
+var float[] bottoms   = array.new_float()
+var bool[]  bulls     = array.new_bool()
+var int[]   formTimes = array.new_int()
+
+hasFvg(int formT, bool isBull) =>
+    bool found = false
+    if array.size(formTimes) > 0
+        for j = 0 to array.size(formTimes) - 1
+            if array.get(formTimes, j) == formT and array.get(bulls, j) == isBull
+                found := true
+                break
+    found
+
+// Invalidation always uses confirmed 15m OHLC from security (syncs 5m ↔ 15m)
+fvgFilled(bool isBull, float top, float bottom) =>
+    mitigateOn == "Close" ? (isBull ? invC < bottom : invC > top) : (isBull ? invL < bottom : invH > top)
+
+removeFvg(int i) =>
+    box.delete(array.get(boxes, i))
+    line ln = array.get(ceLines, i)
+    if not na(ln)
+        line.delete(ln)
+    array.remove(boxes, i)
+    array.remove(ceLines, i)
+    array.remove(tops, i)
+    array.remove(bottoms, i)
+    array.remove(bulls, i)
+    array.remove(formTimes, i)
+
+addFvg(bool isBull, float top, float bottom, int leftT, int formT) =>
+    mid = (top + bottom) / 2.0
+    fill   = isBull ? bullFill : bearFill
+    border = isBull ? bullBorder : bearBorder
+    ext    = extendRight ? extend.right : extend.none
+    b = box.new(leftT, top, formT, bottom, xloc=xloc.bar_time, extend=ext, bgcolor=fill, border_color=border, border_width=1)
+    ln = line.new(leftT, mid, formT, mid, xloc=xloc.bar_time, extend=ext, color=showCE ? ceColor : color.new(ceColor, 100), style=line.style_dashed, width=1)
+    array.push(boxes, b)
+    array.push(ceLines, ln)
+    array.push(tops, top)
+    array.push(bottoms, bottom)
+    array.push(bulls, isBull)
+    array.push(formTimes, formT)
+
+if bullNew and showBull and fvgVisible(tForm) and not hasFvg(tForm, true)
+    addFvg(true, bTop, bBot, tLeft, tForm)
+
+if bearNew and showBear and fvgVisible(tForm) and not hasFvg(tForm, false)
+    addFvg(false, sTop, sBot, tLeft, tForm)
+
+if array.size(boxes) > 0
+    for i = array.size(boxes) - 1 to 0
+        int storedFormT = array.get(formTimes, i)
+        isBull = array.get(bulls, i)
+        top    = array.get(tops, i)
+        bottom = array.get(bottoms, i)
+
+        if barstate.islast and (storedFormT > refTime or not fvgVisible(storedFormT))
+            removeFvg(i)
+            continue
+
+        // Only evaluate fill on a confirmed 15m close; use same 15m OHLC on 5m and 15m
+        if htfBarClosed and storedFormT < tForm and fvgFilled(isBull, top, bottom)
+            removeFvg(i)
