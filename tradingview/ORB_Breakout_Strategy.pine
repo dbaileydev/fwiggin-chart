@@ -10,6 +10,8 @@ strategy("MNQ ORB Breakout", overlay=true, max_boxes_count=50, max_lines_count=5
 grpEntry = "Entry Types"
 useOrbLong  = input.bool(true, "ORB Long (break + close above OR high)", group=grpEntry)
 useOrbShort = input.bool(true, "ORB Short (break + close below OR low)", group=grpEntry)
+useOrFadeLong  = input.bool(true, "OR Fade Long (ORL retest + confirm → ORH)", group=grpEntry)
+useOrFadeShort = input.bool(true, "OR Fade Short (ORH retest + confirm → ORL)", group=grpEntry)
 
 // ── Opening range ────────────────────────────────────────────────────────────
 grpOr = "Opening Range"
@@ -20,22 +22,23 @@ tz           = input.string("America/New_York", "Session Timezone", group=grpOr)
 flatAtClose  = input.bool(true, "Close All Positions at RTH End", group=grpOr)
 skipUsHolidays = input.bool(true, "Skip US Market Holidays", group=grpOr,
      tooltip="No opening range or entries on NYSE/CME full-day closures (incl. Juneteenth).")
-useEntryCutoff = input.bool(true, "Stop New Entries After Cutoff", group=grpOr,
-     tooltip="Off = entries allowed until 4 PM ET. On = no new trades after cutoff (default noon CT).")
-entryCutoffTz  = input.string("America/Chicago", "Entry Cutoff Timezone", group=grpOr)
-entryCutoffH   = input.int(12, "Entry Cutoff Hour (24h)", minval=8, maxval=16, group=grpOr)
-entryCutoffM   = input.int(0, "Entry Cutoff Minute", minval=0, maxval=59, group=grpOr,
-     tooltip="Default 12:00 = noon CT (1:00 PM ET). Last entry on the bar before cutoff.")
 
 // ── Orders ───────────────────────────────────────────────────────────────────
 grpExec = "Orders"
 entryBufferTicks = input.int(1, "Entry Buffer Beyond OR (ticks)", minval=0, group=grpExec,
      tooltip="Long: enter above OR high. Short: enter below OR low.")
-stopBufferTicks  = input.int(1, "Stop Buffer Beyond OR (ticks)", minval=0, group=grpExec,
-     tooltip="Long: stop below OR low. Short: stop above OR high.")
+stopBufferTicks  = input.int(1, "ORB Stop Buffer Beyond OR (ticks)", minval=0, group=grpExec,
+     tooltip="ORB breakout: long stop below ORL, short stop above ORH.")
+fadeStopBufferTicks = input.int(1, "OR Fade Stop Buffer Outside OR (ticks)", minval=1, group=grpExec,
+     tooltip="Fade short: stop above ORH. Fade long: stop below ORL.")
+fadePriorWindowBars = input.int(30, "OR Fade Traverse Lookback (bars)", minval=1, group=grpExec,
+     tooltip="On 1m, 30 bars ≈ 30 min. Count ORH→ORL / ORL→ORH traverses within this window.")
+fadePriorMinTraverses = input.int(2, "OR Fade Min Range Traverses", minval=2, group=grpExec,
+     tooltip="Require at least this many full OR traverses before fade entry.")
 tickSize         = input.float(0.25, "Tick Size", minval=0.01, group=grpExec)
 beAtR            = input.float(2.0, "Move Stop to BE at (R multiple)", minval=0.1, step=0.1, group=grpExec)
 oneTradePerDay   = input.bool(false, "One ORB Trade Per Direction / Day", group=grpExec)
+oneFadePerDay    = input.bool(false, "One OR Fade Per Direction / Day", group=grpExec)
 requireOrReset   = input.bool(true, "Require Close Back Inside OR Before Re-Entry", group=grpExec,
      tooltip="Long: prior close at/below OR high. Short: prior close at/above OR low.")
 
@@ -82,9 +85,6 @@ rthEnded   = inRth[1] and not inRth
 barMins      = hour(time, tz) * 60 + minute(time, tz)
 inRthClock   = barMins >= 9 * 60 + 30 and barMins < 16 * 60
 inEntryClock = barMins >= 9 * 60 + 31 and barMins < 16 * 60
-cutoffBarMins  = hour(time, entryCutoffTz) * 60 + minute(time, entryCutoffTz)
-cutoffMins     = entryCutoffH * 60 + entryCutoffM
-inEntryCutoff  = not useEntryCutoff or cutoffBarMins < cutoffMins
 
 var bool entriesLocked = false
 
@@ -115,8 +115,24 @@ if inOrBar and isTradingDay
 if inOrBar[1] and not inOrBar and isTradingDay
     orReady := true
 
+var bool sessionTouchedOrh = false
+var bool sessionTouchedOrl = false
+
+if bool(newDay)
+    sessionTouchedOrh := false
+    sessionTouchedOrl := false
+
+if orReady and isTradingDay and inRth
+    if high >= orHigh
+        sessionTouchedOrh := true
+    if low <= orLow
+        sessionTouchedOrl := true
+
+orBothTouched = sessionTouchedOrh and sessionTouchedOrl
+
 entryBuffer = entryBufferTicks * tickSize
 stopBuffer  = stopBufferTicks * tickSize
+fadeStopBuffer = fadeStopBufferTicks * tickSize
 
 longEntry  = orReady and not na(orHigh) ? orHigh + entryBuffer : na
 longStop   = orReady and not na(orLow)  ? orLow - stopBuffer : na
@@ -144,35 +160,109 @@ formatExitComment(string exitName, float exitPrice, float initR) =>
 // ── Breakout + trade state ───────────────────────────────────────────────────
 var bool  longTakenToday   = false
 var bool  shortTakenToday  = false
+var bool  fadeLongTaken    = false
+var bool  fadeShortTaken   = false
 var bool  tradeBeArmed     = false
 var bool  tradeHit1R       = false
+var bool  tradeIsRange     = false
+var string tradeEntryId    = na
 var float tradeInitialStop = na
 var float tradeStop        = na
 var float tradeFvgLevel    = na
 var int   tradeFvgBar      = na
 var int   tradeEntryBar    = na
+var int   fadeShortRetestBar   = na
+var int   fadeLongRetestBar    = na
+var int   lastOrhTouchBar       = na
+var int   lastOrlTouchBar       = na
+var int[] rangeTraverseBars     = array.new_int()
 
 if bool(newDay)
     longTakenToday  := false
     shortTakenToday := false
+    fadeLongTaken   := false
+    fadeShortTaken  := false
+    fadeShortRetestBar  := na
+    fadeLongRetestBar   := na
+    lastOrhTouchBar     := na
+    lastOrlTouchBar     := na
+    array.clear(rangeTraverseBars)
 
 longResetOk  = not requireOrReset or close[1] <= orHigh
 shortResetOk = not requireOrReset or close[1] >= orLow
 
-longBreakout  = isTradingDay and orReady and inEntryClock and inEntryCutoff and not entriesLocked and high > orHigh and close > orHigh and longResetOk
-shortBreakout = isTradingDay and orReady and inEntryClock and inEntryCutoff and not entriesLocked and low < orLow and close < orLow and shortResetOk
+longBreakout  = isTradingDay and orReady and inEntryClock and not entriesLocked and high > orHigh and close > orHigh and longResetOk
+shortBreakout = isTradingDay and orReady and inEntryClock and not entriesLocked and low < orLow and close < orLow and shortResetOk
 
-canEnter = isTradingDay and orReady and inRth and inTradeWin and inRthClock and inEntryClock and inEntryCutoff and not entriesLocked and strategy.position_size == 0
+insideOr = orReady and close >= orLow and close <= orHigh
+
+// OR fade: retest level → rejection candle → enter next bar if level holds
+if orBothTouched and insideOr and low <= orHigh
+    fadeShortRetestBar := bar_index
+if orBothTouched and insideOr and high >= orLow
+    fadeLongRetestBar := bar_index
+
+if not na(fadeShortRetestBar) and close > orHigh
+    fadeShortRetestBar := na
+if not na(fadeLongRetestBar) and close < orLow
+    fadeLongRetestBar := na
+
+fadeShortReject = not na(fadeShortRetestBar) and bar_index >= fadeShortRetestBar and insideOr and
+     close < open and close < orHigh
+fadeLongReject  = not na(fadeLongRetestBar) and bar_index >= fadeLongRetestBar and insideOr and
+     close > open and close > orLow
+
+// Prior fade = at least N full range traverses (ORH→ORL or ORL→ORH) in lookback window
+if orReady and orBothTouched and isTradingDay and inRth
+    if low <= orLow
+        if not na(lastOrhTouchBar) and bar_index > lastOrhTouchBar and bar_index - lastOrhTouchBar <= fadePriorWindowBars
+            array.push(rangeTraverseBars, bar_index)
+        lastOrlTouchBar := bar_index
+    if high >= orHigh
+        if not na(lastOrlTouchBar) and bar_index > lastOrlTouchBar and bar_index - lastOrlTouchBar <= fadePriorWindowBars
+            array.push(rangeTraverseBars, bar_index)
+        lastOrhTouchBar := bar_index
+
+if array.size(rangeTraverseBars) > 0
+    for i = array.size(rangeTraverseBars) - 1 to 0
+        if bar_index - array.get(rangeTraverseBars, i) > fadePriorWindowBars
+            array.remove(rangeTraverseBars, i)
+
+fadePriorOk = array.size(rangeTraverseBars) >= fadePriorMinTraverses
+
+orFadeShortSig = fadeShortReject[1] and insideOr and close <= orHigh and fadePriorOk
+orFadeLongSig  = fadeLongReject[1] and insideOr and close >= orLow and fadePriorOk
+
+// Fade stops sit outside the retested boundary (short above ORH, long below ORL)
+fadeShortStop = orHigh + fadeStopBuffer
+fadeLongStop  = orLow - fadeStopBuffer
+
+canEnter = isTradingDay and orReady and inRth and inTradeWin and inRthClock and inEntryClock and not entriesLocked and strategy.position_size == 0
 
 longOk = useOrbLong and canEnter and longBreakout and longStop < longEntry and
      (not oneTradePerDay or not longTakenToday)
 shortOk = useOrbShort and canEnter and shortBreakout and shortStop > shortEntry and
      (not oneTradePerDay or not shortTakenToday)
+fadeShortOk = useOrFadeShort and canEnter and orFadeShortSig and fadeShortStop > close and
+     (not oneFadePerDay or not fadeShortTaken)
+fadeLongOk = useOrFadeLong and canEnter and orFadeLongSig and fadeLongStop < close and
+     (not oneFadePerDay or not fadeLongTaken)
 
 // ── Exit management ──────────────────────────────────────────────────────────
-if strategy.position_size > 0 and not na(tradeInitialStop) and bar_index > tradeEntryBar
+// OR fade: limit TP at opposite OR side; stop outside retested boundary
+if strategy.position_size > 0 and tradeIsRange and tradeEntryId == "OR Fade Long" and not na(orHigh) and not na(orLow)
+    strategy.exit("OR Fade Long Exit", "OR Fade Long", limit=orHigh, stop=orLow - fadeStopBuffer,
+         comment_profit="OR Fade Long ORH TP", comment_loss="OR Fade Long Stop (below ORL)")
+
+if strategy.position_size < 0 and tradeIsRange and tradeEntryId == "OR Fade Short" and not na(orHigh) and not na(orLow)
+    strategy.exit("OR Fade Short Exit", "OR Fade Short", limit=orLow, stop=orHigh + fadeStopBuffer,
+         comment_profit="OR Fade Short ORL TP", comment_loss="OR Fade Short Stop (above ORH)")
+
+if strategy.position_size > 0 and not na(tradeInitialStop) and bar_index > tradeEntryBar and not tradeIsRange
     entryPx = strategy.position_avg_price
     initR   = entryPx - tradeInitialStop
+    exitTag = na(tradeEntryId) ? "ORB Long" : tradeEntryId
+
     minRPx  = entryPx + initR * oppFvgMinR
     bePx    = entryPx + initR * beAtR
 
@@ -190,15 +280,17 @@ if strategy.position_size > 0 and not na(tradeInitialStop) and bar_index > trade
     bullFvgInvalidClose = tradeBeArmed and not na(tradeFvgLevel) and not na(tradeFvgBar) and bar_index > tradeFvgBar and close < open and close < tradeFvgLevel
 
     if not tradeHit1R and bearFvgRaw and bar_index > tradeEntryBar
-        strategy.close("ORB Long", comment=formatExitComment("ORB Long Opp FVG Exit", close, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + " Opp FVG Exit", close, initR))
     else if bullFvgInvalidClose
-        strategy.close("ORB Long", comment=formatExitComment("ORB Long FVG TP", close, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + " FVG TP", close, initR))
     else if low <= tradeStop
-        strategy.close("ORB Long", comment=formatExitComment(tradeBeArmed ? "ORB Long BE Stop" : "ORB Long Stop", tradeStop, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + (tradeBeArmed ? " BE Stop" : " Stop"), tradeStop, initR))
 
-if strategy.position_size < 0 and not na(tradeInitialStop) and bar_index > tradeEntryBar
+if strategy.position_size < 0 and not na(tradeInitialStop) and bar_index > tradeEntryBar and not tradeIsRange
     entryPx = strategy.position_avg_price
     initR   = tradeInitialStop - entryPx
+    exitTag = na(tradeEntryId) ? "ORB Short" : tradeEntryId
+
     minRPx  = entryPx - initR * oppFvgMinR
     bePx    = entryPx - initR * beAtR
 
@@ -216,45 +308,77 @@ if strategy.position_size < 0 and not na(tradeInitialStop) and bar_index > trade
     bearFvgInvalidClose = tradeBeArmed and not na(tradeFvgLevel) and not na(tradeFvgBar) and bar_index > tradeFvgBar and close > open and close > tradeFvgLevel
 
     if not tradeHit1R and bullFvgRaw and bar_index > tradeEntryBar
-        strategy.close("ORB Short", comment=formatExitComment("ORB Short Opp FVG Exit", close, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + " Opp FVG Exit", close, initR))
     else if bearFvgInvalidClose
-        strategy.close("ORB Short", comment=formatExitComment("ORB Short FVG TP", close, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + " FVG TP", close, initR))
     else if high >= tradeStop
-        strategy.close("ORB Short", comment=formatExitComment(tradeBeArmed ? "ORB Short BE Stop" : "ORB Short Stop", tradeStop, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + (tradeBeArmed ? " BE Stop" : " Stop"), tradeStop, initR))
 
 if flatAtClose and rthEnded and strategy.position_size != 0
+    exitTag = na(tradeEntryId) ? "Position" : tradeEntryId
     if strategy.position_size > 0
         initR = strategy.position_avg_price - tradeInitialStop
-        strategy.close("ORB Long", comment=formatExitComment("ORB Long RTH Close", close, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + " RTH Close", close, initR))
     else
         initR = tradeInitialStop - strategy.position_avg_price
-        strategy.close("ORB Short", comment=formatExitComment("ORB Short RTH Close", close, initR))
+        strategy.close(exitTag, comment=formatExitComment(exitTag + " RTH Close", close, initR))
 
 if longOk
     strategy.entry("ORB Long", strategy.long, qty=tradeQty, alert_message="ORB long")
     tradeBeArmed     := false
     tradeHit1R       := false
+    tradeIsRange     := false
+    tradeEntryId     := "ORB Long"
     tradeFvgLevel    := na
     tradeFvgBar      := na
     tradeInitialStop := longStop
     tradeStop        := longStop
     tradeEntryBar    := bar_index
     longTakenToday   := true
-
-if shortOk
+else if shortOk
     strategy.entry("ORB Short", strategy.short, qty=tradeQty, alert_message="ORB short")
     tradeBeArmed     := false
     tradeHit1R       := false
+    tradeIsRange     := false
+    tradeEntryId     := "ORB Short"
     tradeFvgLevel    := na
     tradeFvgBar      := na
     tradeInitialStop := shortStop
     tradeStop        := shortStop
     tradeEntryBar    := bar_index
     shortTakenToday  := true
-
-if strategy.position_size == 0 and not longOk and not shortOk
+else if fadeLongOk
+    strategy.entry("OR Fade Long", strategy.long, qty=tradeQty, alert_message="OR fade long to ORH")
     tradeBeArmed     := false
     tradeHit1R       := false
+    tradeIsRange     := true
+    tradeEntryId     := "OR Fade Long"
+    tradeFvgLevel    := na
+    tradeFvgBar      := na
+    tradeInitialStop := fadeLongStop
+    tradeStop        := fadeLongStop
+    tradeEntryBar    := bar_index
+    fadeLongTaken    := true
+    fadeLongRetestBar  := na
+else if fadeShortOk
+    strategy.entry("OR Fade Short", strategy.short, qty=tradeQty, alert_message="OR fade short to ORL")
+    tradeBeArmed     := false
+    tradeHit1R       := false
+    tradeIsRange     := true
+    tradeEntryId     := "OR Fade Short"
+    tradeFvgLevel    := na
+    tradeFvgBar      := na
+    tradeInitialStop := fadeShortStop
+    tradeStop        := fadeShortStop
+    tradeEntryBar    := bar_index
+    fadeShortTaken   := true
+    fadeShortRetestBar := na
+
+if strategy.position_size == 0 and not longOk and not shortOk and not fadeLongOk and not fadeShortOk
+    tradeBeArmed     := false
+    tradeHit1R       := false
+    tradeIsRange     := false
+    tradeEntryId     := na
     tradeInitialStop := na
     tradeStop        := na
     tradeFvgLevel    := na
