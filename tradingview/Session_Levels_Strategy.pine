@@ -303,7 +303,8 @@ if rthEnded and isTradingDay[1]
 
 // ── VWAP Cross Strategy ──────────────────────────────────────────────────────
 afterOrPeriod = orReady and not na(orStartTime) and (time - orStartTime) > orDurationMs
-canEnter = waitForOr ? afterOrPeriod : (inRth and isTradingDay)
+insideOr = orReady and not na(orHigh) and not na(orLow) and close <= orHigh and close >= orLow
+canEnter = (waitForOr ? afterOrPeriod : (inRth and isTradingDay)) and not insideOr
 
 var bool tradedToday = false
 var int lastTradeExitBar = na
@@ -313,7 +314,7 @@ var float trailStop = na
 var bool trailing = false
 var int tradeEntryTime = na
 var bool timeBeMoved = false
-tradeCooldown = input.int(15, "Trade Cooldown (bars)", minval=0, group=grpStrat)
+tradeCooldown = input.int(17, "Trade Cooldown (bars)", minval=0, group=grpStrat)
 
 if rthStarted
     tradedToday := false
