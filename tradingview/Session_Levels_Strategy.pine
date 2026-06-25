@@ -16,18 +16,30 @@ grpOr = "Opening Range"
 orMinutes = input.int(15, "OR Duration (minutes)", minval=1, maxval=60, group=grpOr,
      tooltip="High/low of the first N minutes after RTH open.")
 
+grpStrat = "VWAP Cross Strategy"
+useStrategy = input.bool(true, "Enable Strategy", group=grpStrat)
+tradeQty = input.int(5, "Contracts", minval=1, group=grpStrat)
+oneTradePerDay = input.bool(false, "One Trade Per Day", group=grpStrat)
+stopBufferTicks = input.int(2, "Stop Buffer (ticks)", minval=0, group=grpStrat)
+trailLookback = input.int(3, "Trail Swing Lookback (bars)", minval=1, group=grpStrat,
+     tooltip="After 1:1, trail stop behind highest high / lowest low of last N bars.")
+rrRatio = input.float(3.0, "Risk:Reward (TP)", minval=0.5, step=0.25, group=grpStrat)
+fvgExitMinPts = input.float(2.0, "FVG Exit Min Size (points)", minval=0, step=0.25, group=grpStrat,
+     tooltip="Min size for an FVG to count as an exit signal when invalidated.")
+waitForOr = input.bool(true, "Wait For OR Completion", group=grpStrat,
+     tooltip="Only trade after the opening range period ends.")
+
 grpVis = "Visuals"
 showOrLines = input.bool(true, "OR High / Low", group=grpVis)
 showOnLines = input.bool(true, "Overnight High / Low (ONH/ONL)", group=grpVis)
 showPdLines = input.bool(true, "Previous Day High / Low (PDH/PDL)", group=grpVis)
-showAvwapLines = input.bool(true, "Anchored VWAP from PDH / PDL", group=grpVis)
+showPriorDayVwap = input.bool(true, "Prior Day VWAP (from prior RTH open)", group=grpVis)
 showSessionVwap = input.bool(true, "Session VWAP", group=grpVis)
 showLabels = input.bool(true, "Session Line Labels", group=grpVis)
 orColor = input.color(color.orange, "OR Color", group=grpVis)
 onColor = input.color(color.teal, "Overnight Color", group=grpVis)
 pdColor = input.color(color.purple, "Prev Day Color", group=grpVis)
-avwapPdhColor = input.color(color.new(#E040FB, 0), "AVWAP from PDH", group=grpVis)
-avwapPdlColor = input.color(color.new(#00BCD4, 0), "AVWAP from PDL", group=grpVis)
+priorDayVwapColor = input.color(color.new(#E040FB, 0), "Prior Day VWAP Color", group=grpVis)
 sessionVwapColor = input.color(color.new(#FFEB3B, 0), "Session VWAP Color", group=grpVis)
 lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=grpVis)
 
@@ -65,10 +77,7 @@ var float pdHigh = na
 var float pdLow = na
 var float rthHigh = na
 var float rthLow = na
-var int rthHighBar = na
-var int rthLowBar = na
-var int pdHighBar = na
-var int pdLowBar = na
+var int priorSessionStartBar = na
 var float ovnTrackHigh = na
 var float ovnTrackLow = na
 
@@ -80,8 +89,6 @@ if rthStarted
     sessionStartBar := bar_index
     rthHigh := na
     rthLow := na
-    rthHighBar := na
-    rthLowBar := na
 
 if inRth and isTradingDay and not na(orStartTime) and not orReady
     elapsed = time - orStartTime
@@ -92,12 +99,8 @@ if inRth and isTradingDay and not na(orStartTime) and not orReady
         orReady := true
 
 if inRth and isTradingDay
-    if na(rthHigh) or high > rthHigh
-        rthHigh := high
-        rthHighBar := bar_index
-    if na(rthLow) or low < rthLow
-        rthLow := low
-        rthLowBar := bar_index
+    rthHigh := na(rthHigh) ? high : math.max(rthHigh, high)
+    rthLow := na(rthLow) ? low : math.min(rthLow, low)
 
 if inOvernight
     ovnTrackHigh := na(ovnTrackHigh) ? high : math.max(ovnTrackHigh, high)
@@ -108,82 +111,42 @@ if rthStarted
     onLow := ovnTrackLow
     ovnTrackHigh := na
     ovnTrackLow := na
-    if not na(pdHigh) and na(pdHighBar)
-        for i = 1 to math.min(bar_index, 2000)
-            t = time[i]
-            dateI = year(t, tz) * 10000 + month(t, tz) * 100 + dayofmonth(t, tz)
-            inRthI = not na(time(timeframe.period, rthSession, tz)[i])
-            if inRthI and dateI < barDateKey and high[i] >= pdHigh - syminfo.mintick
-                pdHighBar := bar_index - i
-                break
-    if not na(pdLow) and na(pdLowBar)
-        for i = 1 to math.min(bar_index, 2000)
-            t = time[i]
-            dateI = year(t, tz) * 10000 + month(t, tz) * 100 + dayofmonth(t, tz)
-            inRthI = not na(time(timeframe.period, rthSession, tz)[i])
-            if inRthI and dateI < barDateKey and low[i] <= pdLow + syminfo.mintick
-                pdLowBar := bar_index - i
-                break
 
 if rthEnded and isTradingDay[1]
-    lastRthBar = bar_index - 1
     pdHigh := rthHigh
     pdLow := rthLow
-    pdHighBar := na(rthHighBar) ? lastRthBar : rthHighBar
-    pdLowBar := na(rthLowBar) ? lastRthBar : rthLowBar
+    priorSessionStartBar := sessionStartBar
     rthHigh := na
     rthLow := na
-    rthHighBar := na
-    rthLowBar := na
     ovnTrackHigh := high
     ovnTrackLow := low
 
-// ── Anchored VWAP from prior session PDH / PDL bar ───────────────────────────
+// ── Prior day VWAP (anchored at previous RTH session open) ───────────────────
 vwapSrc = hlc3
 barVol = math.max(nz(volume), 1)
 
-var float pdhCumPv = na
-var float pdhCumV = na
-var float pdlCumPv = na
-var float pdlCumV = na
-var int lastPdhAnchor = na
-var int lastPdlAnchor = na
+var float priorDayCumPv = na
+var float priorDayCumV = na
+var int lastPriorAnchor = na
 
-pdhAnchorChanged = not na(pdHighBar) and (na(lastPdhAnchor) or pdHighBar != lastPdhAnchor)
-pdlAnchorChanged = not na(pdLowBar) and (na(lastPdlAnchor) or pdLowBar != lastPdlAnchor)
+priorAnchorChanged = not na(priorSessionStartBar) and (na(lastPriorAnchor) or priorSessionStartBar != lastPriorAnchor)
 
-if pdhAnchorChanged
-    lastPdhAnchor := pdHighBar
-    pdhCumPv := 0.0
-    pdhCumV := 0.0
-    barsBack = bar_index - pdHighBar
+if priorAnchorChanged
+    lastPriorAnchor := priorSessionStartBar
+    priorDayCumPv := 0.0
+    priorDayCumV := 0.0
+    barsBack = bar_index - priorSessionStartBar
     for i = 0 to barsBack
-        pdhCumPv += hlc3[i] * math.max(nz(volume[i]), 1)
-        pdhCumV += math.max(nz(volume[i]), 1)
-else if not na(pdHighBar) and bar_index > pdHighBar
-    pdhCumPv := nz(pdhCumPv[1], 0.0) + vwapSrc * barVol
-    pdhCumV := nz(pdhCumV[1], 0.0) + barVol
+        priorDayCumPv += hlc3[i] * math.max(nz(volume[i]), 1)
+        priorDayCumV += math.max(nz(volume[i]), 1)
+else if not na(priorSessionStartBar) and bar_index > priorSessionStartBar
+    priorDayCumPv := nz(priorDayCumPv[1], 0.0) + vwapSrc * barVol
+    priorDayCumV := nz(priorDayCumV[1], 0.0) + barVol
 
-if pdlAnchorChanged
-    lastPdlAnchor := pdLowBar
-    pdlCumPv := 0.0
-    pdlCumV := 0.0
-    barsBack = bar_index - pdLowBar
-    for i = 0 to barsBack
-        pdlCumPv += hlc3[i] * math.max(nz(volume[i]), 1)
-        pdlCumV += math.max(nz(volume[i]), 1)
-else if not na(pdLowBar) and bar_index > pdLowBar
-    pdlCumPv := nz(pdlCumPv[1], 0.0) + vwapSrc * barVol
-    pdlCumV := nz(pdlCumV[1], 0.0) + barVol
+priorDayVwap = not na(priorDayCumV) and priorDayCumV > 0 ? priorDayCumPv / priorDayCumV : na
+showPriorVwap = showPriorDayVwap and inRth and isTradingDay and not na(priorDayVwap)
 
-avwapFromPdh = not na(pdhCumV) and pdhCumV > 0 ? pdhCumPv / pdhCumV : na
-avwapFromPdl = not na(pdlCumV) and pdlCumV > 0 ? pdlCumPv / pdlCumV : na
-
-showAvwapPdh = showAvwapLines and inRth and isTradingDay and not na(avwapFromPdh) and not na(pdHighBar)
-showAvwapPdl = showAvwapLines and inRth and isTradingDay and not na(avwapFromPdl) and not na(pdLowBar)
-
-plot(showAvwapPdh ? avwapFromPdh : na, "AVWAP PDH", color=avwapPdhColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
-plot(showAvwapPdl ? avwapFromPdl : na, "AVWAP PDL", color=avwapPdlColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
+plot(showPriorVwap ? priorDayVwap : na, "Prior Day VWAP", color=priorDayVwapColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
 
 // ── Session VWAP (resets at RTH open) ────────────────────────────────────────
 var float sessVwapCumPv = 0.0
@@ -214,8 +177,7 @@ var label onHighLbl = na
 var label onLowLbl = na
 var label pdHighLbl = na
 var label pdLowLbl = na
-var label avwapPdhLbl = na
-var label avwapPdlLbl = na
+var label priorDayVwapLbl = na
 var label sessVwapLbl = na
 
 newLevelLine(int x1, float price, color clr, bool dashed) =>
@@ -265,8 +227,7 @@ if rthStarted
     onLowLbl := na
     pdHighLbl := na
     pdLowLbl := na
-    avwapPdhLbl := na
-    avwapPdlLbl := na
+    priorDayVwapLbl := na
     sessVwapLbl := na
 
     if showOnLines and not na(onHigh)
@@ -298,9 +259,8 @@ if inRth and isTradingDay
         extendLevelLine(pdLowLine, pdLow)
         pdHighLbl := syncLevelLabel(pdHighLbl, "PDH", pdHigh, pdColor)
         pdLowLbl := syncLevelLabel(pdLowLbl, "PDL", pdLow, pdColor)
-    if showAvwapLines
-        avwapPdhLbl := syncLevelLabel(avwapPdhLbl, "AVWAP PDH", avwapFromPdh, avwapPdhColor)
-        avwapPdlLbl := syncLevelLabel(avwapPdlLbl, "AVWAP PDL", avwapFromPdl, avwapPdlColor)
+    if showPriorDayVwap and not na(priorDayVwap)
+        priorDayVwapLbl := syncLevelLabel(priorDayVwapLbl, "PD VWAP", priorDayVwap, priorDayVwapColor)
     if showSessionVwap and not na(sessionVwap)
         sessVwapLbl := syncLevelLabel(sessVwapLbl, "VWAP", sessionVwap, sessionVwapColor)
 
@@ -322,9 +282,8 @@ if rthEnded and isTradingDay[1]
         freezeLevelLine(pdLowLine, endBar, startBar)
         freezeLevelLabel(pdHighLbl, endBar)
         freezeLevelLabel(pdLowLbl, endBar)
-    if showAvwapLines
-        freezeLevelLabel(avwapPdhLbl, endBar)
-        freezeLevelLabel(avwapPdlLbl, endBar)
+    if showPriorDayVwap
+        freezeLevelLabel(priorDayVwapLbl, endBar)
     if showSessionVwap
         freezeLevelLabel(sessVwapLbl, endBar)
     orHighLine := na
@@ -339,11 +298,156 @@ if rthEnded and isTradingDay[1]
     onLowLbl := na
     pdHighLbl := na
     pdLowLbl := na
-    avwapPdhLbl := na
-    avwapPdlLbl := na
+    priorDayVwapLbl := na
     sessVwapLbl := na
 
-// ── Strategy logic goes here ─────────────────────────────────────────────────
-// Available levels: orHigh, orLow, orReady, onHigh, onLow, pdHigh, pdLow
-//                   avwapFromPdh, avwapFromPdl, sessionVwap, pdHighBar, pdLowBar
-// Available state: inRth, isTradingDay, rthStarted, rthEnded, sessionStartBar
+// ── VWAP Cross Strategy ──────────────────────────────────────────────────────
+afterOrPeriod = orReady and not na(orStartTime) and (time - orStartTime) > orDurationMs
+canEnter = waitForOr ? afterOrPeriod : (inRth and isTradingDay)
+
+var bool tradedToday = false
+var int lastTradeExitBar = na
+var float tradeEntryPx = na
+var float tradeRisk = na
+var float trailStop = na
+var bool trailing = false
+var int tradeEntryTime = na
+var bool timeBeMoved = false
+tradeCooldown = input.int(20, "Trade Cooldown (bars)", minval=0, group=grpStrat)
+
+if rthStarted
+    tradedToday := false
+    lastTradeExitBar := na
+    tradeEntryPx := na
+    tradeRisk := na
+    trailStop := na
+    trailing := false
+    tradeEntryTime := na
+    timeBeMoved := false
+
+// Detect any closed trade for cooldown
+if strategy.closedtrades > 0
+    lastTradeBar = strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+    if na(lastTradeExitBar) or lastTradeBar > lastTradeExitBar
+        lastTradeExitBar := lastTradeBar
+
+inCooldown = not na(lastTradeExitBar) and bar_index - lastTradeExitBar < tradeCooldown
+
+stopBuf = stopBufferTicks * syminfo.mintick
+
+aboveBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close > sessionVwap and close > priorDayVwap
+belowBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close < sessionVwap and close < priorDayVwap
+
+crossAboveSessVwap = not na(sessionVwap) and close > sessionVwap and close[1] <= sessionVwap[1]
+crossAbovePdVwap = not na(priorDayVwap) and close > priorDayVwap and close[1] <= priorDayVwap[1]
+crossBelowSessVwap = not na(sessionVwap) and close < sessionVwap and close[1] >= sessionVwap[1]
+crossBelowPdVwap = not na(priorDayVwap) and close < priorDayVwap and close[1] >= priorDayVwap[1]
+
+longSignal = canEnter and aboveBothVwap and (crossAboveSessVwap or crossAbovePdVwap)
+shortSignal = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelowPdVwap)
+
+maxVwapDist = input.float(20.0, "Max Distance From VWAP (points)", minval=0, step=1.0, group=grpStrat)
+nearVwap = (not na(sessionVwap) and math.abs(close - sessionVwap) <= maxVwapDist) or (not na(priorDayVwap) and math.abs(close - priorDayVwap) <= maxVwapDist)
+
+canTrade = useStrategy and inRth and isTradingDay and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown and nearVwap
+
+if canTrade and longSignal
+    entryPx = close
+    stopPx = low - stopBuf
+    risk = entryPx - stopPx
+    if risk > 0
+        tpPx = entryPx + risk * rrRatio
+        strategy.entry("Long", strategy.long, qty=tradeQty)
+        strategy.exit("Long SL", "Long", stop=stopPx, comment="Stop Loss")
+        strategy.exit("Long TP", "Long", limit=tpPx, comment="3:1 TP")
+        tradedToday := true
+        tradeEntryPx := entryPx
+        tradeRisk := risk
+        tradeEntryTime := time
+        timeBeMoved := false
+        trailing := false
+        trailStop := na
+
+if canTrade and shortSignal
+    entryPx = close
+    stopPx = high + stopBuf
+    risk = stopPx - entryPx
+    if risk > 0
+        tpPx = entryPx - risk * rrRatio
+        strategy.entry("Short", strategy.short, qty=tradeQty)
+        strategy.exit("Short SL", "Short", stop=stopPx, comment="Stop Loss")
+        strategy.exit("Short TP", "Short", limit=tpPx, comment="3:1 TP")
+        tradedToday := true
+        tradeEntryPx := entryPx
+        tradeRisk := risk
+        tradeEntryTime := time
+        timeBeMoved := false
+        trailing := false
+        trailStop := na
+
+// ── Time-based BE: if not 1:1 within 30 min, move stop to entry ─────────────
+timeoutMs = 30 * 60 * 1000
+if strategy.position_size != 0 and not trailing and not timeBeMoved and not na(tradeEntryTime)
+    elapsed = time - tradeEntryTime
+    if elapsed >= timeoutMs
+        if strategy.position_size > 0
+            strategy.exit("Long SL", "Long", stop=tradeEntryPx, comment="Time BE")
+        if strategy.position_size < 0
+            strategy.exit("Short SL", "Short", stop=tradeEntryPx, comment="Time BE")
+        timeBeMoved := true
+
+// ── Swing-high trailing stop (activates at 1:1) ─────────────────────────────
+if strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk)
+    if not trailing and high >= tradeEntryPx + tradeRisk
+        trailing := true
+    if trailing
+        swingLow = low
+        for i = 1 to trailLookback - 1
+            swingLow := math.min(swingLow, low[i])
+        newTrail = swingLow - stopBuf
+        if na(trailStop) or newTrail > trailStop
+            trailStop := newTrail
+        strategy.exit("Long SL", "Long", stop=trailStop, comment="Trail Stop")
+
+if strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
+    if not trailing and low <= tradeEntryPx - tradeRisk
+        trailing := true
+    if trailing
+        swingHigh = high
+        for i = 1 to trailLookback - 1
+            swingHigh := math.max(swingHigh, high[i])
+        newTrail = swingHigh + stopBuf
+        if na(trailStop) or newTrail < trailStop
+            trailStop := newTrail
+        strategy.exit("Short SL", "Short", stop=trailStop, comment="Trail Stop")
+
+// ── FVG invalidation exit ────────────────────────────────────────────────────
+// Track most recent FVG in our trade direction; exit if it gets invalidated
+bullFvg = low > high[2] and (low - high[2]) >= fvgExitMinPts
+bearFvg = high < low[2] and (low[2] - high) >= fvgExitMinPts
+
+var float longFvgBot = na
+var float shortFvgTop = na
+
+if rthStarted
+    longFvgBot := na
+    shortFvgTop := na
+
+if strategy.position_size > 0 and bullFvg
+    longFvgBot := high[2]
+
+if strategy.position_size < 0 and bearFvg
+    shortFvgTop := low[2]
+
+// If long and our bullish FVG gets invalidated (price closes below FVG bottom)
+if strategy.position_size > 0 and not na(longFvgBot) and close < longFvgBot
+    strategy.close("Long", comment="FVG Invalidated")
+    longFvgBot := na
+
+// If short and our bearish FVG gets invalidated (price closes above FVG top)
+if strategy.position_size < 0 and not na(shortFvgTop) and close > shortFvgTop
+    strategy.close("Short", comment="FVG Invalidated")
+    shortFvgTop := na
+
+plotshape(useStrategy and longSignal, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(useStrategy and shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
