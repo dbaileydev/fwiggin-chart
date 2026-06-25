@@ -1,0 +1,349 @@
+// Session Levels — blank canvas for strategy development
+//@version=5
+strategy("Session Levels", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=50,
+     initial_capital=50000, currency=currency.USD,
+     calc_on_every_tick=false, process_orders_on_close=true)
+
+// ── Session inputs ───────────────────────────────────────────────────────────
+grpSess = "Sessions"
+rthSession = input.session("0930-1600:23456", "RTH Session", group=grpSess,
+     tooltip="Regular trading hours. Lines extend across this session.")
+tz = input.string("America/New_York", "Timezone", group=grpSess)
+skipUsHolidays = input.bool(true, "Skip US Holidays", group=grpSess)
+
+grpOr = "Opening Range"
+orMinutes = input.int(5, "OR Duration (minutes)", minval=1, maxval=60, group=grpOr,
+     tooltip="High/low of the first N minutes after RTH open.")
+
+grpVis = "Visuals"
+showOrLines = input.bool(true, "OR High / Low", group=grpVis)
+showOnLines = input.bool(true, "Overnight High / Low (ONH/ONL)", group=grpVis)
+showPdLines = input.bool(true, "Previous Day High / Low (PDH/PDL)", group=grpVis)
+showAvwapLines = input.bool(true, "Anchored VWAP from PDH / PDL", group=grpVis)
+showSessionVwap = input.bool(true, "Session VWAP", group=grpVis)
+showLabels = input.bool(true, "Session Line Labels", group=grpVis)
+orColor = input.color(color.orange, "OR Color", group=grpVis)
+onColor = input.color(color.teal, "Overnight Color", group=grpVis)
+pdColor = input.color(color.purple, "Prev Day Color", group=grpVis)
+avwapPdhColor = input.color(color.new(#E040FB, 0), "AVWAP from PDH", group=grpVis)
+avwapPdlColor = input.color(color.new(#00BCD4, 0), "AVWAP from PDL", group=grpVis)
+sessionVwapColor = input.color(color.new(#FFEB3B, 0), "Session VWAP Color", group=grpVis)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=grpVis)
+
+// ── Calendar ─────────────────────────────────────────────────────────────────
+var int[] usMarketHolidays = array.from(
+     20240101, 20240115, 20240219, 20240329, 20240527, 20240619, 20240704, 20240902, 20241128, 20241225,
+     20250101, 20250120, 20250217, 20250418, 20250526, 20250619, 20250704, 20250901, 20251127, 20251225,
+     20260101, 20260119, 20260216, 20260403, 20260525, 20260619, 20260703, 20260907, 20261126, 20261225,
+     20270101, 20270118, 20270215, 20270326, 20270531, 20270618, 20270705, 20270906, 20271125, 20271224)
+
+isUsHoliday(int ymd) =>
+    skipUsHolidays and array.includes(usMarketHolidays, ymd)
+
+barDateKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+isTradingDay = dayofweek(time, tz) != dayofweek.saturday and dayofweek(time, tz) != dayofweek.sunday and not isUsHoliday(barDateKey)
+
+inRth = not na(time(timeframe.period, rthSession, tz))
+inOvernight = not inRth
+rthStarted = inRth and not inRth[1] and isTradingDay
+rthEnded = inRth[1] and not inRth
+
+orDurationMs = orMinutes * 60 * 1000
+
+// ── Opening range (first N minutes of RTH) ───────────────────────────────────
+var float orHigh = na
+var float orLow = na
+var bool orReady = false
+var int orStartTime = na
+var int sessionStartBar = na
+
+// ── ONH/ONL & PDH/PDL ───────────────────────────────────────────────────────
+var float onHigh = na
+var float onLow = na
+var float pdHigh = na
+var float pdLow = na
+var float rthHigh = na
+var float rthLow = na
+var int rthHighBar = na
+var int rthLowBar = na
+var int pdHighBar = na
+var int pdLowBar = na
+var float ovnTrackHigh = na
+var float ovnTrackLow = na
+
+if rthStarted
+    orHigh := na
+    orLow := na
+    orReady := false
+    orStartTime := time
+    sessionStartBar := bar_index
+    rthHigh := na
+    rthLow := na
+    rthHighBar := na
+    rthLowBar := na
+
+if inRth and isTradingDay and not na(orStartTime) and not orReady
+    elapsed = time - orStartTime
+    if elapsed < orDurationMs
+        orHigh := na(orHigh) ? high : math.max(orHigh, high)
+        orLow := na(orLow) ? low : math.min(orLow, low)
+    else if not na(orHigh) and not na(orLow)
+        orReady := true
+
+if inRth and isTradingDay
+    if na(rthHigh) or high > rthHigh
+        rthHigh := high
+        rthHighBar := bar_index
+    if na(rthLow) or low < rthLow
+        rthLow := low
+        rthLowBar := bar_index
+
+if inOvernight
+    ovnTrackHigh := na(ovnTrackHigh) ? high : math.max(ovnTrackHigh, high)
+    ovnTrackLow := na(ovnTrackLow) ? low : math.min(ovnTrackLow, low)
+
+if rthStarted
+    onHigh := ovnTrackHigh
+    onLow := ovnTrackLow
+    ovnTrackHigh := na
+    ovnTrackLow := na
+    if not na(pdHigh) and na(pdHighBar)
+        for i = 1 to math.min(bar_index, 2000)
+            t = time[i]
+            dateI = year(t, tz) * 10000 + month(t, tz) * 100 + dayofmonth(t, tz)
+            inRthI = not na(time(timeframe.period, rthSession, tz)[i])
+            if inRthI and dateI < barDateKey and high[i] >= pdHigh - syminfo.mintick
+                pdHighBar := bar_index - i
+                break
+    if not na(pdLow) and na(pdLowBar)
+        for i = 1 to math.min(bar_index, 2000)
+            t = time[i]
+            dateI = year(t, tz) * 10000 + month(t, tz) * 100 + dayofmonth(t, tz)
+            inRthI = not na(time(timeframe.period, rthSession, tz)[i])
+            if inRthI and dateI < barDateKey and low[i] <= pdLow + syminfo.mintick
+                pdLowBar := bar_index - i
+                break
+
+if rthEnded and isTradingDay[1]
+    lastRthBar = bar_index - 1
+    pdHigh := rthHigh
+    pdLow := rthLow
+    pdHighBar := na(rthHighBar) ? lastRthBar : rthHighBar
+    pdLowBar := na(rthLowBar) ? lastRthBar : rthLowBar
+    rthHigh := na
+    rthLow := na
+    rthHighBar := na
+    rthLowBar := na
+    ovnTrackHigh := high
+    ovnTrackLow := low
+
+// ── Anchored VWAP from prior session PDH / PDL bar ───────────────────────────
+vwapSrc = hlc3
+barVol = math.max(nz(volume), 1)
+
+var float pdhCumPv = na
+var float pdhCumV = na
+var float pdlCumPv = na
+var float pdlCumV = na
+var int lastPdhAnchor = na
+var int lastPdlAnchor = na
+
+pdhAnchorChanged = not na(pdHighBar) and (na(lastPdhAnchor) or pdHighBar != lastPdhAnchor)
+pdlAnchorChanged = not na(pdLowBar) and (na(lastPdlAnchor) or pdLowBar != lastPdlAnchor)
+
+if pdhAnchorChanged
+    lastPdhAnchor := pdHighBar
+    pdhCumPv := 0.0
+    pdhCumV := 0.0
+    barsBack = bar_index - pdHighBar
+    for i = 0 to barsBack
+        pdhCumPv += hlc3[i] * math.max(nz(volume[i]), 1)
+        pdhCumV += math.max(nz(volume[i]), 1)
+else if not na(pdHighBar) and bar_index > pdHighBar
+    pdhCumPv := nz(pdhCumPv[1], 0.0) + vwapSrc * barVol
+    pdhCumV := nz(pdhCumV[1], 0.0) + barVol
+
+if pdlAnchorChanged
+    lastPdlAnchor := pdLowBar
+    pdlCumPv := 0.0
+    pdlCumV := 0.0
+    barsBack = bar_index - pdLowBar
+    for i = 0 to barsBack
+        pdlCumPv += hlc3[i] * math.max(nz(volume[i]), 1)
+        pdlCumV += math.max(nz(volume[i]), 1)
+else if not na(pdLowBar) and bar_index > pdLowBar
+    pdlCumPv := nz(pdlCumPv[1], 0.0) + vwapSrc * barVol
+    pdlCumV := nz(pdlCumV[1], 0.0) + barVol
+
+avwapFromPdh = not na(pdhCumV) and pdhCumV > 0 ? pdhCumPv / pdhCumV : na
+avwapFromPdl = not na(pdlCumV) and pdlCumV > 0 ? pdlCumPv / pdlCumV : na
+
+showAvwapPdh = showAvwapLines and inRth and isTradingDay and not na(avwapFromPdh) and not na(pdHighBar)
+showAvwapPdl = showAvwapLines and inRth and isTradingDay and not na(avwapFromPdl) and not na(pdLowBar)
+
+plot(showAvwapPdh ? avwapFromPdh : na, "AVWAP PDH", color=avwapPdhColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
+plot(showAvwapPdl ? avwapFromPdl : na, "AVWAP PDL", color=avwapPdlColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
+
+// ── Session VWAP (resets at RTH open) ────────────────────────────────────────
+var float sessVwapCumPv = 0.0
+var float sessVwapCumV = 0.0
+
+if rthStarted
+    sessVwapCumPv := vwapSrc * barVol
+    sessVwapCumV := barVol
+else if inRth and isTradingDay
+    sessVwapCumPv += vwapSrc * barVol
+    sessVwapCumV += barVol
+
+sessionVwap = sessVwapCumV > 0 ? sessVwapCumPv / sessVwapCumV : na
+showSessVwap = showSessionVwap and inRth and isTradingDay and not na(sessionVwap)
+
+plot(showSessVwap ? sessionVwap : na, "Session VWAP", color=sessionVwapColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
+
+// ── Session lines + labels ───────────────────────────────────────────────────
+var line orHighLine = na
+var line orLowLine = na
+var line onHighLine = na
+var line onLowLine = na
+var line pdHighLine = na
+var line pdLowLine = na
+var label orHighLbl = na
+var label orLowLbl = na
+var label onHighLbl = na
+var label onLowLbl = na
+var label pdHighLbl = na
+var label pdLowLbl = na
+var label avwapPdhLbl = na
+var label avwapPdlLbl = na
+var label sessVwapLbl = na
+
+newLevelLine(int x1, float price, color clr, bool dashed) =>
+    line.new(x1, price, bar_index, price, xloc=xloc.bar_index, extend=extend.none,
+         color=clr, width=lineWidth, style=dashed ? line.style_dashed : line.style_solid)
+
+syncLevelLabel(label lbl, string txt, float price, color clr) =>
+    label out = lbl
+    if showLabels
+        if na(lbl)
+            out := label.new(bar_index, price, txt, xloc=xloc.bar_index, style=label.style_none,
+                 textcolor=clr, size=size.small)
+        else
+            label.set_x(lbl, bar_index)
+            label.set_y(lbl, price)
+    out
+
+extendLevelLine(line ln, float price) =>
+    if not na(ln) and inRth and not na(sessionStartBar)
+        line.set_x1(ln, sessionStartBar)
+        line.set_x2(ln, bar_index)
+        line.set_y1(ln, price)
+        line.set_y2(ln, price)
+
+freezeLevelLine(line ln, int endBar, int startBar) =>
+    if not na(ln)
+        price = line.get_y1(ln)
+        line.set_x1(ln, startBar)
+        line.set_x2(ln, endBar)
+        line.set_y1(ln, price)
+        line.set_y2(ln, price)
+
+freezeLevelLabel(label lbl, int endBar) =>
+    if not na(lbl) and showLabels
+        label.set_x(lbl, endBar)
+
+if rthStarted
+    orHighLine := na
+    orLowLine := na
+    onHighLine := na
+    onLowLine := na
+    pdHighLine := na
+    pdLowLine := na
+    orHighLbl := na
+    orLowLbl := na
+    onHighLbl := na
+    onLowLbl := na
+    pdHighLbl := na
+    pdLowLbl := na
+    avwapPdhLbl := na
+    avwapPdlLbl := na
+    sessVwapLbl := na
+
+    if showOnLines and not na(onHigh)
+        onHighLine := newLevelLine(sessionStartBar, onHigh, onColor, false)
+    if showOnLines and not na(onLow)
+        onLowLine := newLevelLine(sessionStartBar, onLow, onColor, false)
+    if showPdLines and not na(pdHigh)
+        pdHighLine := newLevelLine(sessionStartBar, pdHigh, pdColor, true)
+    if showPdLines and not na(pdLow)
+        pdLowLine := newLevelLine(sessionStartBar, pdLow, pdColor, true)
+
+if orReady and showOrLines and na(orHighLine) and not na(orHigh) and not na(orLow)
+    orHighLine := newLevelLine(sessionStartBar, orHigh, orColor, false)
+    orLowLine := newLevelLine(sessionStartBar, orLow, orColor, false)
+
+if inRth and isTradingDay
+    if showOrLines and orReady
+        extendLevelLine(orHighLine, orHigh)
+        extendLevelLine(orLowLine, orLow)
+        orHighLbl := syncLevelLabel(orHighLbl, "ORH", orHigh, orColor)
+        orLowLbl := syncLevelLabel(orLowLbl, "ORL", orLow, orColor)
+    if showOnLines
+        extendLevelLine(onHighLine, onHigh)
+        extendLevelLine(onLowLine, onLow)
+        onHighLbl := syncLevelLabel(onHighLbl, "ONH", onHigh, onColor)
+        onLowLbl := syncLevelLabel(onLowLbl, "ONL", onLow, onColor)
+    if showPdLines
+        extendLevelLine(pdHighLine, pdHigh)
+        extendLevelLine(pdLowLine, pdLow)
+        pdHighLbl := syncLevelLabel(pdHighLbl, "PDH", pdHigh, pdColor)
+        pdLowLbl := syncLevelLabel(pdLowLbl, "PDL", pdLow, pdColor)
+    if showAvwapLines
+        avwapPdhLbl := syncLevelLabel(avwapPdhLbl, "AVWAP PDH", avwapFromPdh, avwapPdhColor)
+        avwapPdlLbl := syncLevelLabel(avwapPdlLbl, "AVWAP PDL", avwapFromPdl, avwapPdlColor)
+    if showSessionVwap and not na(sessionVwap)
+        sessVwapLbl := syncLevelLabel(sessVwapLbl, "VWAP", sessionVwap, sessionVwapColor)
+
+if rthEnded and isTradingDay[1]
+    endBar = bar_index - 1
+    startBar = sessionStartBar
+    if showOrLines and orReady
+        freezeLevelLine(orHighLine, endBar, startBar)
+        freezeLevelLine(orLowLine, endBar, startBar)
+        freezeLevelLabel(orHighLbl, endBar)
+        freezeLevelLabel(orLowLbl, endBar)
+    if showOnLines
+        freezeLevelLine(onHighLine, endBar, startBar)
+        freezeLevelLine(onLowLine, endBar, startBar)
+        freezeLevelLabel(onHighLbl, endBar)
+        freezeLevelLabel(onLowLbl, endBar)
+    if showPdLines
+        freezeLevelLine(pdHighLine, endBar, startBar)
+        freezeLevelLine(pdLowLine, endBar, startBar)
+        freezeLevelLabel(pdHighLbl, endBar)
+        freezeLevelLabel(pdLowLbl, endBar)
+    if showAvwapLines
+        freezeLevelLabel(avwapPdhLbl, endBar)
+        freezeLevelLabel(avwapPdlLbl, endBar)
+    if showSessionVwap
+        freezeLevelLabel(sessVwapLbl, endBar)
+    orHighLine := na
+    orLowLine := na
+    onHighLine := na
+    onLowLine := na
+    pdHighLine := na
+    pdLowLine := na
+    orHighLbl := na
+    orLowLbl := na
+    onHighLbl := na
+    onLowLbl := na
+    pdHighLbl := na
+    pdLowLbl := na
+    avwapPdhLbl := na
+    avwapPdlLbl := na
+    sessVwapLbl := na
+
+// ── Strategy logic goes here ─────────────────────────────────────────────────
+// Available levels: orHigh, orLow, orReady, onHigh, onLow, pdHigh, pdLow
+//                   avwapFromPdh, avwapFromPdl, sessionVwap, pdHighBar, pdLowBar
+// Available state: inRth, isTradingDay, rthStarted, rthEnded, sessionStartBar
