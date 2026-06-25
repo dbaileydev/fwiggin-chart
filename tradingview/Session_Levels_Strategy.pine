@@ -13,7 +13,7 @@ tz = input.string("America/New_York", "Timezone", group=grpSess)
 skipUsHolidays = input.bool(true, "Skip US Holidays", group=grpSess)
 
 grpOr = "Opening Range"
-orMinutes = input.int(5, "OR Duration (minutes)", minval=1, maxval=60, group=grpOr,
+orMinutes = input.int(15, "OR Duration (minutes)", minval=1, maxval=60, group=grpOr,
      tooltip="High/low of the first N minutes after RTH open.")
 
 grpVis = "Visuals"
