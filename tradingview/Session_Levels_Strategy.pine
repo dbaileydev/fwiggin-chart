@@ -313,7 +313,7 @@ var float trailStop = na
 var bool trailing = false
 var int tradeEntryTime = na
 var bool timeBeMoved = false
-tradeCooldown = input.int(20, "Trade Cooldown (bars)", minval=0, group=grpStrat)
+tradeCooldown = input.int(15, "Trade Cooldown (bars)", minval=0, group=grpStrat)
 
 if rthStarted
     tradedToday := false
@@ -343,8 +343,8 @@ crossAbovePdVwap = not na(priorDayVwap) and close > priorDayVwap and close[1] <=
 crossBelowSessVwap = not na(sessionVwap) and close < sessionVwap and close[1] >= sessionVwap[1]
 crossBelowPdVwap = not na(priorDayVwap) and close < priorDayVwap and close[1] >= priorDayVwap[1]
 
-longSignal = canEnter and aboveBothVwap and (crossAboveSessVwap or crossAbovePdVwap)
-shortSignal = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelowPdVwap)
+longSignal = canEnter and (crossAboveSessVwap or crossAbovePdVwap) and close > sessionVwap and close > priorDayVwap
+shortSignal = canEnter and (crossBelowSessVwap or crossBelowPdVwap) and close < sessionVwap and close < priorDayVwap
 
 maxVwapDist = input.float(20.0, "Max Distance From VWAP (points)", minval=0, step=1.0, group=grpStrat)
 nearVwap = (not na(sessionVwap) and math.abs(close - sessionVwap) <= maxVwapDist) or (not na(priorDayVwap) and math.abs(close - priorDayVwap) <= maxVwapDist)
@@ -449,5 +449,24 @@ if strategy.position_size < 0 and not na(shortFvgTop) and close > shortFvgTop
     strategy.close("Short", comment="FVG Invalidated")
     shortFvgTop := na
 
-plotshape(useStrategy and longSignal, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small)
-plotshape(useStrategy and shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+// Only mark arrows on trades we actually take
+enteredLong = canTrade and longSignal
+enteredShort = canTrade and shortSignal
+
+plotshape(useStrategy and enteredLong, "Long Entry", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(useStrategy and enteredShort, "Short Entry", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+
+// PnL label on trade close
+var int prevClosedTrades = 0
+if strategy.closedtrades > prevClosedTrades
+    pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    pnlStr = pnl >= 0 ? "+" + str.tostring(pnl, "#.##") : str.tostring(pnl, "#.##")
+    lbl_clr = pnl >= 0 ? color.lime : color.red
+    exitBar = strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+    exitPrice = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    isLong = strategy.closedtrades.size(strategy.closedtrades - 1) > 0
+    lbl_style = isLong ? label.style_label_up : label.style_label_down
+    lbl_y = isLong ? exitPrice - syminfo.mintick * 20 : exitPrice + syminfo.mintick * 20
+    label.new(exitBar, lbl_y, "$" + pnlStr, xloc=xloc.bar_index, style=lbl_style,
+         color=color.new(lbl_clr, 70), textcolor=lbl_clr, size=size.normal)
+    prevClosedTrades := strategy.closedtrades
