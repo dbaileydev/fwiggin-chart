@@ -10,7 +10,10 @@ grpSess = "Sessions"
 rthSession = input.session("0930-1600:23456", "RTH Session", group=grpSess,
      tooltip="Regular trading hours. Lines extend across this session.")
 tz = input.string("America/New_York", "Timezone", group=grpSess)
+tzCt = "America/Chicago"
 skipUsHolidays = input.bool(true, "Skip US Holidays", group=grpSess)
+skipFomcDays = input.bool(true, "Skip FOMC Days", group=grpSess,
+     tooltip="No trades on FOMC rate decision days (statement release day, ET).")
 
 grpOr = "Opening Range"
 orMinutes = input.int(15, "OR Duration (minutes)", minval=1, maxval=60, group=grpOr,
@@ -22,12 +25,21 @@ tradeQty = input.int(5, "Contracts", minval=1, group=grpStrat)
 oneTradePerDay = input.bool(false, "One Trade Per Day", group=grpStrat)
 stopBufferTicks = input.int(2, "Stop Buffer (ticks)", minval=0, group=grpStrat)
 trailLookback = input.int(3, "Trail Swing Lookback (bars)", minval=1, group=grpStrat,
-     tooltip="After 1:1, trail stop behind highest high / lowest low of last N bars.")
+     tooltip="After trail R:R is hit, trail stop behind swing high/low of last N bars.")
+trailActivateRr = input.float(2.0, "Trail Activate R:R", minval=0.5, step=0.25, group=grpStrat,
+     tooltip="Start trailing stop once price reaches this multiple of initial risk.")
 rrRatio = input.float(3.0, "Risk:Reward (TP)", minval=0.5, step=0.25, group=grpStrat)
-fvgExitMinPts = input.float(2.0, "FVG Exit Min Size (points)", minval=0, step=0.25, group=grpStrat,
-     tooltip="Min size for an FVG to count as an exit signal when invalidated.")
 waitForOr = input.bool(true, "Wait For OR Completion", group=grpStrat,
      tooltip="Only trade after the opening range period ends.")
+tradeCooldown = input.int(20, "Trade Cooldown (bars)", minval=0, group=grpStrat,
+     tooltip="Bars to wait after a trade closes before taking another entry.")
+oppBodyPct = input.float(0.60, "Opposite Candle Body % Filter", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
+     tooltip="Skip entry if prior bar body is this % of its range and in the opposite direction. Set to 0 to disable.")
+entryEndHourCt = input.int(14, "No Entries After Hour (CT)", minval=0, maxval=23, group=grpStrat)
+entryEndMinuteCt = input.int(30, "No Entries After Minute (CT)", minval=0, maxval=59, group=grpStrat,
+     tooltip="No new entries at or after this Central Time (America/Chicago).")
+showSkipLabels = input.bool(true, "Show Skip Reasons", group=grpStrat,
+     tooltip="Orange X on skipped signals. Click that bar → Data Window (right panel) shows the skip reason.")
 
 grpVis = "Visuals"
 showOrLines = input.bool(true, "OR High / Low", group=grpVis)
@@ -50,20 +62,34 @@ var int[] usMarketHolidays = array.from(
      20260101, 20260119, 20260216, 20260403, 20260525, 20260619, 20260703, 20260907, 20261126, 20261225,
      20270101, 20270118, 20270215, 20270326, 20270531, 20270618, 20270705, 20270906, 20271125, 20271224)
 
+// FOMC statement release days (second day of each meeting, America/New_York)
+var int[] fomcDates = array.from(
+     20240131, 20240320, 20240501, 20240612, 20240731, 20240918, 20241107, 20241218,
+     20250129, 20250319, 20250507, 20250618, 20250730, 20250917, 20251029, 20251210,
+     20260128, 20260318, 20260429, 20260617, 20260729, 20260916, 20261028, 20261209,
+     20270127, 20270317, 20270428, 20270609, 20270728, 20270915, 20271027, 20271208)
+
 isUsHoliday(int ymd) =>
     skipUsHolidays and array.includes(usMarketHolidays, ymd)
 
+isFomcDay(int ymd) =>
+    skipFomcDays and array.includes(fomcDates, ymd)
+
 barDateKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
-isTradingDay = dayofweek(time, tz) != dayofweek.saturday and dayofweek(time, tz) != dayofweek.sunday and not isUsHoliday(barDateKey)
+isTradingDay = dayofweek(time, tz) != dayofweek.saturday and dayofweek(time, tz) != dayofweek.sunday and not isUsHoliday(barDateKey) and not isFomcDay(barDateKey)
 
 inRth = not na(time(timeframe.period, rthSession, tz))
 inOvernight = not inRth
 rthStarted = inRth and not inRth[1] and isTradingDay
 rthEnded = inRth[1] and not inRth
 
+entryCutoffMinsCt = entryEndHourCt * 60 + entryEndMinuteCt
+barMinsCt = hour(time, tzCt) * 60 + minute(time, tzCt)
+beforeEntryCutoff = barMinsCt < entryCutoffMinsCt
+
 orDurationMs = orMinutes * 60 * 1000
 
-// ── Opening range (open/close of 1st RTH candle) ─────────────────────────────
+// ── Opening range (first N minutes of RTH) ───────────────────────────────────
 var float orHigh = na
 var float orLow = na
 var bool orReady = false
@@ -82,13 +108,21 @@ var float ovnTrackHigh = na
 var float ovnTrackLow = na
 
 if rthStarted
+    orHigh := na
+    orLow := na
+    orReady := false
     orStartTime := time
     sessionStartBar := bar_index
     rthHigh := na
     rthLow := na
-    orHigh := high
-    orLow := low
-    orReady := true
+
+if inRth and isTradingDay and not na(orStartTime) and not orReady
+    elapsed = time - orStartTime
+    if elapsed < orDurationMs
+        orHigh := na(orHigh) ? high : math.max(orHigh, high)
+        orLow := na(orLow) ? low : math.min(orLow, low)
+    else if not na(orHigh) and not na(orLow)
+        orReady := true
 
 if inRth and isTradingDay
     rthHigh := na(rthHigh) ? high : math.max(rthHigh, high)
@@ -257,6 +291,10 @@ if inRth and isTradingDay
         sessVwapLbl := syncLevelLabel(sessVwapLbl, "VWAP", sessionVwap, sessionVwapColor)
 
 if rthEnded and isTradingDay[1]
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Session End")
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Session End")
     endBar = bar_index - 1
     startBar = sessionStartBar
     if showOrLines and orReady
@@ -293,3 +331,201 @@ if rthEnded and isTradingDay[1]
     priorDayVwapLbl := na
     sessVwapLbl := na
 
+// ── VWAP Cross Strategy ──────────────────────────────────────────────────────
+afterOrPeriod = orReady and not na(orStartTime) and (time - orStartTime) > orDurationMs
+canEnter = beforeEntryCutoff and (waitForOr ? afterOrPeriod : (inRth and isTradingDay))
+
+var bool tradedToday = false
+var int lastTradeExitBar = na
+var float tradeEntryPx = na
+var float tradeRisk = na
+var float trailStop = na
+var bool trailing = false
+var int tradeEntryTime = na
+var int tradeEntryBar = na
+var int longEntryBar = na
+var int shortEntryBar = na
+var float tradeStopPx = na
+var float tradeTpPx = na
+
+if rthStarted
+    tradedToday := false
+    lastTradeExitBar := na
+    tradeEntryPx := na
+    tradeRisk := na
+    trailStop := na
+    trailing := false
+    tradeEntryTime := na
+    tradeEntryBar := na
+    longEntryBar := na
+    shortEntryBar := na
+    tradeStopPx := na
+    tradeTpPx := na
+
+// Detect any closed trade for cooldown
+if strategy.closedtrades > 0
+    lastTradeBar = strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+    if na(lastTradeExitBar) or lastTradeBar > lastTradeExitBar
+        lastTradeExitBar := lastTradeBar
+
+inCooldown = not na(lastTradeExitBar) and bar_index - lastTradeExitBar < tradeCooldown
+
+stopBuf = stopBufferTicks * syminfo.mintick
+
+aboveBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close > sessionVwap and close > priorDayVwap
+belowBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close < sessionVwap and close < priorDayVwap
+
+crossAboveSessVwap = not na(sessionVwap) and close > sessionVwap and close[1] <= sessionVwap[1]
+crossAbovePdVwap = not na(priorDayVwap) and close > priorDayVwap and close[1] <= priorDayVwap[1]
+crossBelowSessVwap = not na(sessionVwap) and close < sessionVwap and close[1] >= sessionVwap[1]
+crossBelowPdVwap = not na(priorDayVwap) and close < priorDayVwap and close[1] >= priorDayVwap[1]
+
+priorRange = high[1] - low[1]
+priorBodyPct = priorRange > 0 ? math.abs(close[1] - open[1]) / priorRange : 0.0
+priorBearish = close[1] < open[1]
+priorBullish = close[1] > open[1]
+oppFilterOn = oppBodyPct > 0
+
+strongBearPrior = oppFilterOn and priorBearish and priorBodyPct >= oppBodyPct
+strongBullPrior = oppFilterOn and priorBullish and priorBodyPct >= oppBodyPct
+
+longSignal = canEnter and aboveBothVwap and (crossAboveSessVwap or crossAbovePdVwap) and not strongBearPrior
+shortSignal = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelowPdVwap) and not strongBullPrior
+
+canTrade = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown
+
+tradeBlockReason() =>
+    if not useStrategy
+        "Strategy off"
+    else if not inRth
+        "Outside RTH"
+    else if isFomcDay(barDateKey)
+        "FOMC day"
+    else if isUsHoliday(barDateKey)
+        "Holiday"
+    else if not isTradingDay
+        "No session"
+    else if not beforeEntryCutoff
+        "After cutoff"
+    else if waitForOr and not afterOrPeriod
+        "Wait for OR"
+    else if strategy.position_size != 0
+        "In position"
+    else if oneTradePerDay and tradedToday
+        "1 trade/day"
+    else if inCooldown
+        "Cooldown"
+    else
+        "Blocked"
+
+if canTrade and longSignal
+    entryPx = close
+    stopPx = low - stopBuf
+    risk = entryPx - stopPx
+    if risk > 0
+        strategy.entry("Long", strategy.long, qty=tradeQty)
+        tradedToday := true
+        tradeEntryPx := entryPx
+        tradeRisk := risk
+        tradeEntryTime := time
+        tradeEntryBar := bar_index
+        longEntryBar := bar_index
+        tradeStopPx := stopPx
+        tradeTpPx := entryPx + risk * rrRatio
+        trailing := false
+        trailStop := na
+
+if canTrade and shortSignal
+    entryPx = close
+    stopPx = high + stopBuf
+    risk = stopPx - entryPx
+    if risk > 0
+        strategy.entry("Short", strategy.short, qty=tradeQty)
+        tradedToday := true
+        tradeEntryPx := entryPx
+        tradeRisk := risk
+        tradeEntryTime := time
+        tradeEntryBar := bar_index
+        shortEntryBar := bar_index
+        tradeStopPx := stopPx
+        tradeTpPx := entryPx - risk * rrRatio
+        trailing := false
+        trailStop := na
+
+enteredLongThisBar = not na(longEntryBar) and longEntryBar == bar_index
+enteredShortThisBar = not na(shortEntryBar) and shortEntryBar == bar_index
+longSkipped = useStrategy and showSkipLabels and longSignal and not enteredLongThisBar
+shortSkipped = useStrategy and showSkipLabels and shortSignal and not enteredShortThisBar
+
+exitsArmed = strategy.position_size != 0 and not na(tradeEntryBar) and bar_index > tradeEntryBar
+
+if exitsArmed and not trailing
+    if strategy.position_size > 0
+        strategy.exit("Long SL", "Long", stop=tradeStopPx, comment="Stop Loss")
+        strategy.exit("Long TP", "Long", limit=tradeTpPx, comment="3:1 TP")
+    if strategy.position_size < 0
+        strategy.exit("Short SL", "Short", stop=tradeStopPx, comment="Stop Loss")
+        strategy.exit("Short TP", "Short", limit=tradeTpPx, comment="3:1 TP")
+
+if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEntryBar
+    tradeEntryBar := na
+    longEntryBar := na
+    shortEntryBar := na
+    tradeStopPx := na
+    tradeTpPx := na
+
+// ── Swing trailing stop (activates at trail R:R) ───────────────────────────
+if exitsArmed and strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk)
+    if not trailing and high >= tradeEntryPx + tradeRisk * trailActivateRr
+        trailing := true
+    if trailing
+        swingLow = low
+        for i = 1 to trailLookback - 1
+            swingLow := math.min(swingLow, low[i])
+        newTrail = swingLow - stopBuf
+        if na(trailStop) or newTrail > trailStop
+            trailStop := newTrail
+        strategy.exit("Long SL", "Long", stop=trailStop, comment="Trail Stop")
+
+if exitsArmed and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
+    if not trailing and low <= tradeEntryPx - tradeRisk * trailActivateRr
+        trailing := true
+    if trailing
+        swingHigh = high
+        for i = 1 to trailLookback - 1
+            swingHigh := math.max(swingHigh, high[i])
+        newTrail = swingHigh + stopBuf
+        if na(trailStop) or newTrail < trailStop
+            trailStop := newTrail
+        strategy.exit("Short SL", "Short", stop=trailStop, comment="Trail Stop")
+
+
+plotshape(useStrategy and longSignal, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(useStrategy and shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+// ── Skip reason text on chart ────────────────────────────────────────────────
+plotshape(longSkipped and inCooldown, "Skip: Cooldown", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
+plotshape(longSkipped and not inCooldown and strategy.position_size != 0, "Skip: In pos", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="In position")
+plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="1 trade/day")
+plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and not beforeEntryCutoff, "Skip: Cutoff", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="After cutoff")
+plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and waitForOr and not afterOrPeriod, "Skip: OR wait", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Wait for OR")
+
+plotshape(shortSkipped and inCooldown, "Skip: Cooldown S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
+plotshape(shortSkipped and not inCooldown and strategy.position_size != 0, "Skip: In pos S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="In position")
+plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="1 trade/day")
+plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and not beforeEntryCutoff, "Skip: Cutoff S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="After cutoff")
+plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and waitForOr and not afterOrPeriod, "Skip: OR wait S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Wait for OR")
+
+// PnL label on trade exit
+var int prevClosedTrades = 0
+if strategy.closedtrades > prevClosedTrades
+    pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    pnlStr = pnl >= 0 ? "+" + str.tostring(pnl, "#.##") : str.tostring(pnl, "#.##")
+    lbl_clr = pnl >= 0 ? color.lime : color.red
+    exitBar = strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+    exitPrice = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    isLong = strategy.closedtrades.size(strategy.closedtrades - 1) > 0
+    lbl_style = isLong ? label.style_label_up : label.style_label_down
+    lbl_y = isLong ? exitPrice - syminfo.mintick * 20 : exitPrice + syminfo.mintick * 20
+    label.new(exitBar, lbl_y, "$" + pnlStr, xloc=xloc.bar_index, style=lbl_style,
+         color=color.new(lbl_clr, 70), textcolor=lbl_clr, size=size.normal)
+    prevClosedTrades := strategy.closedtrades
