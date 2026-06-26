@@ -76,3 +76,4 @@ The indicator draws FVG boxes, plots EMA trend filter, and marks **LONG** / **SH
 
 - yfinance intraday history is limited (5m ≈ 60 days). For longer or tick-level backtests, export data from your broker or data vendor and pass `--csv`.
 - This is a research scaffold, not live trading advice. Validate on out-of-sample data before risking capital.
+# fwiggin-chart
