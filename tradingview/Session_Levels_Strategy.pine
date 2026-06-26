@@ -42,6 +42,12 @@ oppBodyPct = input.float(0.60, "Long Opposite Candle Body %", minval=0.0, maxval
      tooltip="Skip long if prior bar is strong bearish (body >= this % of range). Set to 0 to disable.")
 oppBodyPctShort = input.float(0.70, "Short Opposite Candle Body %", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
      tooltip="Skip short if prior bar is strong bullish (body >= this % of range). Set to 0 to disable.")
+skipShortWhenBullEma = input.bool(true, "Skip Shorts When 9 EMA > 21 EMA", group=grpStrat,
+     tooltip="No short entries while fast EMA is above slow EMA (bullish stack).")
+skipAfterOppositeSetup = input.bool(true, "Skip After Opposite Setup", group=grpStrat,
+     tooltip="No entry if the prior bar had a VWAP cross setup in the opposite direction.")
+emaFastLen = input.int(9, "Fast EMA Length", minval=1, group=grpStrat)
+emaSlowLen = input.int(21, "Slow EMA Length", minval=2, group=grpStrat)
 flattenAt2Pm = input.bool(true, "Flatten All at 2PM CT", group=grpStrat,
      tooltip="At 2PM CT, close all open positions (winners, losers, and trailing).")
 useDailyLossCap = input.bool(true, "Daily Loss Cap", group=grpStrat,
@@ -52,6 +58,14 @@ requireFreshCross = input.bool(true, "Require Fresh VWAP Cross", group=grpStrat,
      tooltip="Prior bar must not already be fully above/below both VWAPs. Blocks chase entries.")
 maxVwapDistPts = input.float(50.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Skip if entry close is farther than this from session VWAP. Set to 0 to disable.")
+skipFlatVwaps = input.bool(true, "Skip When VWAPs Flat / Compressed", group=grpStrat,
+     tooltip="No entries when session + prior-day VWAP are close together and not sloping (chop).")
+vwapSlopeLookback = input.int(6, "VWAP Flat Lookback (bars)", minval=1, group=grpStrat,
+     tooltip="Bars to measure VWAP movement. 6 bars = 30 min on a 5m chart.")
+maxVwapSpreadPts = input.float(30.0, "Max VWAP Spread (pts)", minval=0, step=5.0, group=grpStrat,
+     tooltip="Session and prior-day VWAP must be farther apart than this. Both within = compressed chop.")
+maxVwapSlopePts = input.float(15.0, "Max VWAP Slope (pts)", minval=0, step=5.0, group=grpStrat,
+     tooltip="Each VWAP must rise/fall more than this over the lookback. Both below = flat. Set to 0 to disable.")
 maxEntryRiskPts = input.float(80.0, "Max Entry Bar Risk (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Skip if signal-bar stop risk exceeds this. Set to 0 to disable.")
 entryEndHourCt = input.int(14, "No Entries After Hour (CT)", minval=0, maxval=23, group=grpStrat)
@@ -409,6 +423,10 @@ dailyLossCapHit = useDailyLossCap and maxDailyLossUsd > 0 and inRth and isTradin
 
 stopBuf = stopBufferTicks * syminfo.mintick
 
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+shortBullEma = skipShortWhenBullEma and emaFast > emaSlow
+
 aboveBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close > sessionVwap and close > priorDayVwap
 belowBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close < sessionVwap and close < priorDayVwap
 
@@ -442,11 +460,23 @@ withinVwapDistShort = maxVwapDistPts <= 0 or (not na(sessionVwap) and sessionVwa
 validLongRisk = maxEntryRiskPts <= 0 or longRiskEst <= maxEntryRiskPts
 validShortRisk = maxEntryRiskPts <= 0 or shortRiskEst <= maxEntryRiskPts
 
+barsSinceSession = not na(sessionStartBar) ? bar_index - sessionStartBar : 0
+canMeasureVwapFlat = barsSinceSession >= vwapSlopeLookback and not na(sessionVwap) and not na(priorDayVwap) and not na(sessionVwap[vwapSlopeLookback]) and not na(priorDayVwap[vwapSlopeLookback])
+sessVwapSlopePts = canMeasureVwapFlat ? math.abs(sessionVwap - sessionVwap[vwapSlopeLookback]) : na
+pdVwapSlopePts = canMeasureVwapFlat ? math.abs(priorDayVwap - priorDayVwap[vwapSlopeLookback]) : na
+vwapSpreadPts = canMeasureVwapFlat ? math.abs(sessionVwap - priorDayVwap) : na
+vwapsCompressed = maxVwapSpreadPts > 0 and vwapSpreadPts <= maxVwapSpreadPts
+vwapsSloping = maxVwapSlopePts > 0 and sessVwapSlopePts <= maxVwapSlopePts and pdVwapSlopePts <= maxVwapSlopePts
+bothVwapsFlat = skipFlatVwaps and canMeasureVwapFlat and vwapsCompressed and vwapsSloping
+
 longVwapSetup = canEnter and aboveBothVwap and (crossAboveSessVwap or crossAbovePdVwap) and not strongBearPrior
 shortVwapSetup = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelowPdVwap) and not strongBullPriorShort
 
-longSignal = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk
-shortSignal = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk
+priorOppositeShort = skipAfterOppositeSetup and shortVwapSetup[1]
+priorOppositeLong = skipAfterOppositeSetup and longVwapSetup[1]
+
+longSignal = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not bothVwapsFlat
+shortSignal = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk and not shortBullEma and not priorOppositeLong and not bothVwapsFlat
 
 canTrade = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown and not dailyLossCapHit
 
@@ -599,6 +629,8 @@ plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and not
 plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and not afterEntryStart, "Skip: Early L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Before 10am")
 plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Wait for OR")
 plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and (not waitForOr or afterOrPeriod) and not freshLongBreak, "Skip: Chase L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Chase")
+plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and bothVwapsFlat, "Skip: Flat VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Flat VWAP")
+plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and priorOppositeShort, "Skip: Opp setup L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Opp setup")
 plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and not withinVwapDistLong, "Skip: Far VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Far VWAP")
 plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and not validLongRisk, "Skip: Wide stop L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Wide stop")
 
@@ -610,6 +642,9 @@ plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and no
 plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and not afterEntryStart, "Skip: Early S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Before 10am")
 plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Wait for OR")
 plotshape(shortFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and (not waitForOr or afterOrPeriod) and not freshShortBreak, "Skip: Chase S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Chase")
+plotshape(shortFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and not shortBullEma and not priorOppositeLong and bothVwapsFlat, "Skip: Flat VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Flat VWAP")
+plotshape(shortFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and not shortBullEma and priorOppositeLong, "Skip: Opp setup S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Opp setup")
+plotshape(shortFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and shortBullEma, "Skip: Bull EMA S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="9>21 EMA")
 plotshape(shortFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshShortBreak and not withinVwapDistShort, "Skip: Far VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Far VWAP")
 plotshape(shortFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and not validShortRisk, "Skip: Wide stop S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Wide stop")
 
