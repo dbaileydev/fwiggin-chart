@@ -50,6 +50,12 @@ useDailyLossCap = input.bool(true, "Daily Loss Cap", group=grpStrat,
      tooltip="Block new entries once session PnL (realized + open) reaches max daily loss.")
 maxDailyLossUsd = input.float(800.0, "Max Daily Loss (USD)", minval=0, step=50, group=grpStrat,
      tooltip="No new entries after session loss exceeds this amount. Set to 0 to disable.")
+useLossStreakPause = input.bool(true, "Pause After Loss Streak", group=grpStrat,
+     tooltip="After N consecutive losing sessions, block entries until M potential winning sessions.")
+lossStreakDays = input.int(2, "Consecutive Loss Days to Pause", minval=1, group=grpStrat,
+     tooltip="Only back-to-back traded sessions count. A no-trade day resets the streak.")
+recoveryWinDays = input.int(2, "Winning Days to Resume", minval=1, group=grpStrat,
+     tooltip="While paused, paper-track first signal each day. Resume after this many consecutive winning paper days. No-signal days reset the count.")
 requireFreshCross = input.bool(true, "Require Fresh VWAP Cross", group=grpStrat,
      tooltip="Prior bar must not already be fully above/below both VWAPs. Blocks chase entries.")
 maxVwapDistPts = input.float(50.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
@@ -76,13 +82,20 @@ showOnLines = input.bool(true, "Overnight High / Low (ONH/ONL)", group=grpVis)
 showPdLines = input.bool(true, "Previous Day High / Low (PDH/PDL)", group=grpVis)
 showPriorDayVwap = input.bool(true, "Prior Day VWAP (from prior RTH open)", group=grpVis)
 showSessionVwap = input.bool(true, "Session VWAP", group=grpVis)
+showSessionEma9 = input.bool(true, "Session 9 EMA", group=grpVis,
+     tooltip="9 EMA reset at RTH open — RTH bars only, no overnight carry.")
+showSessionEma21 = input.bool(true, "Session 21 EMA", group=grpVis,
+     tooltip="21 EMA reset at RTH open — RTH bars only, no overnight carry.")
 showLabels = input.bool(true, "Session Line Labels", group=grpVis)
 orColor = input.color(color.orange, "OR Color", group=grpVis)
 onColor = input.color(color.teal, "Overnight Color", group=grpVis)
 pdColor = input.color(color.purple, "Prev Day Color", group=grpVis)
 priorDayVwapColor = input.color(color.new(#E040FB, 0), "Prior Day VWAP Color", group=grpVis)
 sessionVwapColor = input.color(color.new(#FFEB3B, 0), "Session VWAP Color", group=grpVis)
+sessionEma9Color = input.color(color.new(#00E5FF, 0), "Session 9 EMA Color", group=grpVis)
+sessionEma21Color = input.color(color.new(#FF9100, 0), "Session 21 EMA Color", group=grpVis)
 lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=grpVis)
+emaLineWidth = input.int(1, "EMA Line Width", minval=1, maxval=4, group=grpVis)
 
 // ── Calendar ─────────────────────────────────────────────────────────────────
 var int[] usMarketHolidays = array.from(
@@ -222,6 +235,26 @@ sessionVwap = sessVwapCumV > 0 ? sessVwapCumPv / sessVwapCumV : na
 showSessVwap = showSessionVwap and inRth and isTradingDay and not na(sessionVwap)
 
 plot(showSessVwap ? sessionVwap : na, "Session VWAP", color=sessionVwapColor, linewidth=lineWidth, style=plot.style_linebr, display=display.all)
+
+// ── Session EMAs (reset at RTH open) ─────────────────────────────────────────
+ema9Alpha = 2.0 / (9 + 1)
+ema21Alpha = 2.0 / (21 + 1)
+
+var float sessEma9 = na
+var float sessEma21 = na
+
+if rthStarted
+    sessEma9 := close
+    sessEma21 := close
+else if inRth and isTradingDay
+    sessEma9 := sessEma9 + ema9Alpha * (close - sessEma9)
+    sessEma21 := sessEma21 + ema21Alpha * (close - sessEma21)
+
+showSessEma9 = showSessionEma9 and inRth and isTradingDay and not na(sessEma9)
+showSessEma21 = showSessionEma21 and inRth and isTradingDay and not na(sessEma21)
+
+plot(showSessEma9 ? sessEma9 : na, "Session 9 EMA", color=sessionEma9Color, linewidth=emaLineWidth, style=plot.style_linebr, display=display.all)
+plot(showSessEma21 ? sessEma21 : na, "Session 21 EMA", color=sessionEma21Color, linewidth=emaLineWidth, style=plot.style_linebr, display=display.all)
 
 // ── Session lines + labels ───────────────────────────────────────────────────
 var line orHighLine = na
@@ -385,6 +418,16 @@ var float tradeTpPx = na
 var float tradePartialPx = na
 var bool partialTaken = false
 
+var bool lossStreakPaused = false
+var int consecutiveLossDays = 0
+var int consecutiveRecoveryWins = 0
+var bool paperTradedToday = false
+var bool paperActive = false
+var bool paperStoppedOut = false
+var float paperEntryPx = na
+var float paperStopPx = na
+var int paperDir = 0
+
 if rthStarted
     tradedToday := false
     lastLossExitBar := na
@@ -402,6 +445,38 @@ if rthStarted
     tradeTpPx := na
     tradePartialPx := na
     partialTaken := false
+    paperTradedToday := false
+    paperActive := false
+    paperStoppedOut := false
+    paperEntryPx := na
+    paperStopPx := na
+    paperDir := 0
+
+if rthEnded and isTradingDay[1] and useLossStreakPause
+    endedSessionPnl = strategy.netprofit - sessionStartNetProfit
+    if lossStreakPaused
+        if paperTradedToday
+            paperWin = not paperStoppedOut and (paperDir == 1 ? close[1] - paperEntryPx : paperEntryPx - close[1]) > 0
+            if paperWin
+                consecutiveRecoveryWins += 1
+            else
+                consecutiveRecoveryWins := 0
+            if consecutiveRecoveryWins >= recoveryWinDays
+                lossStreakPaused := false
+                consecutiveRecoveryWins := 0
+                consecutiveLossDays := 0
+        else
+            consecutiveRecoveryWins := 0
+    else if tradedToday
+        if endedSessionPnl < 0
+            consecutiveLossDays += 1
+        else
+            consecutiveLossDays := 0
+        if consecutiveLossDays >= lossStreakDays
+            lossStreakPaused := true
+            consecutiveRecoveryWins := 0
+    else
+        consecutiveLossDays := 0
 
 // Loss-only cooldown (current session)
 if strategy.closedtrades > 0 and not na(sessionStartBar)
@@ -470,7 +545,7 @@ priorOppositeLong = skipAfterOppositeSetup and longVwapSetup[1]
 longSignal = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not bothVwapsFlat
 shortSignal = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not bothVwapsFlat
 
-canTrade = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown and not dailyLossCapHit
+canTrade = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown and not dailyLossCapHit and not (useLossStreakPause and lossStreakPaused)
 
 tradeBlockReason() =>
     if not useStrategy
@@ -497,6 +572,8 @@ tradeBlockReason() =>
         "Cooldown"
     else if dailyLossCapHit
         "Daily loss cap"
+    else if useLossStreakPause and lossStreakPaused
+        "Loss streak pause"
     else
         "Blocked"
 
@@ -537,6 +614,31 @@ if canTrade and shortSignal
         partialTaken := false
         trailing := false
         trailStop := na
+
+// Paper-track first signal while paused (counts toward recovery winning days)
+if useLossStreakPause and lossStreakPaused and inRth and isTradingDay and beforeEntryCutoff and not paperTradedToday and strategy.position_size == 0
+    if longSignal and longRiskEst > 0
+        paperTradedToday := true
+        paperActive := true
+        paperEntryPx := close
+        paperStopPx := low - stopBuf
+        paperDir := 1
+        paperStoppedOut := false
+    else if shortSignal and shortRiskEst > 0
+        paperTradedToday := true
+        paperActive := true
+        paperEntryPx := close
+        paperStopPx := high + stopBuf
+        paperDir := -1
+        paperStoppedOut := false
+
+if paperActive and not paperStoppedOut
+    if paperDir == 1 and low <= paperStopPx
+        paperStoppedOut := true
+        paperActive := false
+    else if paperDir == -1 and high >= paperStopPx
+        paperStoppedOut := true
+        paperActive := false
 
 enteredLongThisBar = not na(longEntryBar) and longEntryBar == bar_index
 enteredShortThisBar = not na(shortEntryBar) and shortEntryBar == bar_index
@@ -614,7 +716,8 @@ plotshape(useStrategy and longSignal, "Long Signal", shape.triangleup, location.
 plotshape(useStrategy and shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
 // ── Skip reason text on chart ────────────────────────────────────────────────
 plotshape(longSkipped and dailyLossCapHit, "Skip: Daily cap L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Daily cap")
-plotshape(longSkipped and not dailyLossCapHit and inCooldown, "Skip: Cooldown", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
+plotshape(longSkipped and not dailyLossCapHit and useLossStreakPause and lossStreakPaused, "Skip: Loss streak L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Loss streak")
+plotshape(longSkipped and not dailyLossCapHit and not (useLossStreakPause and lossStreakPaused) and inCooldown, "Skip: Cooldown", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
 plotshape(longSkipped and not inCooldown and strategy.position_size != 0, "Skip: In pos", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="In position")
 plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="1 trade/day")
 plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and not beforeEntryCutoff, "Skip: Cutoff", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="After cutoff")
@@ -627,7 +730,8 @@ plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and 
 plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and not validLongRisk, "Skip: Wide stop L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Wide stop")
 
 plotshape(shortSkipped and dailyLossCapHit, "Skip: Daily cap S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Daily cap")
-plotshape(shortSkipped and not dailyLossCapHit and inCooldown, "Skip: Cooldown S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
+plotshape(shortSkipped and not dailyLossCapHit and useLossStreakPause and lossStreakPaused, "Skip: Loss streak S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Loss streak")
+plotshape(shortSkipped and not dailyLossCapHit and not (useLossStreakPause and lossStreakPaused) and inCooldown, "Skip: Cooldown S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
 plotshape(shortSkipped and not inCooldown and strategy.position_size != 0, "Skip: In pos S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="In position")
 plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="1 trade/day")
 plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and not beforeEntryCutoff, "Skip: Cutoff S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="After cutoff")
