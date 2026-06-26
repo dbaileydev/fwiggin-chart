@@ -42,8 +42,12 @@ oppBodyPct = input.float(0.60, "Long Opposite Candle Body %", minval=0.0, maxval
      tooltip="Skip long if prior bar is strong bearish (body >= this % of range). Set to 0 to disable.")
 oppBodyPctShort = input.float(0.70, "Short Opposite Candle Body %", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
      tooltip="Skip short if prior bar is strong bullish (body >= this % of range). Set to 0 to disable.")
-flattenGreenAt2Pm = input.bool(true, "Flatten Green at 2PM CT", group=grpStrat,
-     tooltip="At 2PM CT, close open winners that have not activated trailing stop.")
+flattenAt2Pm = input.bool(true, "Flatten All at 2PM CT", group=grpStrat,
+     tooltip="At 2PM CT, close all open positions (winners, losers, and trailing).")
+useDailyLossCap = input.bool(true, "Daily Loss Cap", group=grpStrat,
+     tooltip="Block new entries once session PnL (realized + open) reaches max daily loss.")
+maxDailyLossUsd = input.float(800.0, "Max Daily Loss (USD)", minval=0, step=50, group=grpStrat,
+     tooltip="No new entries after session loss exceeds this amount. Set to 0 to disable.")
 requireFreshCross = input.bool(true, "Require Fresh VWAP Cross", group=grpStrat,
      tooltip="Prior bar must not already be fully above/below both VWAPs. Blocks chase entries.")
 maxVwapDistPts = input.float(50.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
@@ -357,6 +361,7 @@ canEnter = beforeEntryCutoff and afterEntryStart and (waitForOr ? afterOrPeriod 
 var bool tradedToday = false
 var int lastLossExitBar = na
 var bool flattenedAt2Pm = false
+var float sessionStartNetProfit = na
 var float tradeEntryPx = na
 var float tradeRisk = na
 var float trailStop = na
@@ -374,6 +379,7 @@ if rthStarted
     tradedToday := false
     lastLossExitBar := na
     flattenedAt2Pm := false
+    sessionStartNetProfit := strategy.netprofit
     tradeEntryPx := na
     tradeRisk := na
     trailStop := na
@@ -396,6 +402,10 @@ if strategy.closedtrades > 0 and not na(sessionStartBar)
         lastLossExitBar := exitBar
 
 inCooldown = not na(lastLossExitBar) and not na(sessionStartBar) and lastLossExitBar >= sessionStartBar and bar_index - lastLossExitBar < lossCooldown
+
+sessionRealizedPnl = not na(sessionStartNetProfit) ? strategy.netprofit - sessionStartNetProfit : 0.0
+sessionPnl = sessionRealizedPnl + strategy.openprofit
+dailyLossCapHit = useDailyLossCap and maxDailyLossUsd > 0 and inRth and isTradingDay and sessionPnl <= -maxDailyLossUsd
 
 stopBuf = stopBufferTicks * syminfo.mintick
 
@@ -438,7 +448,7 @@ shortVwapSetup = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelo
 longSignal = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk
 shortSignal = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk
 
-canTrade = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown
+canTrade = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not inCooldown and not dailyLossCapHit
 
 tradeBlockReason() =>
     if not useStrategy
@@ -463,6 +473,8 @@ tradeBlockReason() =>
         "1 trade/day"
     else if inCooldown
         "Cooldown"
+    else if dailyLossCapHit
+        "Daily loss cap"
     else
         "Blocked"
 
@@ -515,30 +527,29 @@ exitsArmed = strategy.position_size != 0 and not na(tradeEntryBar) and bar_index
 partialQty = int(math.floor(tradeQty * partialExitPct / 100.0))
 canPartial = not partialTaken and partialQty >= 1 and partialQty < tradeQty
 
-// Flatten green open trades at 2PM CT if trail not active
-if flattenGreenAt2Pm and inRth and isTradingDay and not flattenedAt2Pm and barMinsCt >= entryCutoffMinsCt
-    if strategy.position_size > 0 and not trailing and not na(tradeEntryPx) and close > tradeEntryPx
+// Flatten all open trades at 2PM CT
+if flattenAt2Pm and inRth and isTradingDay and not flattenedAt2Pm and barMinsCt >= entryCutoffMinsCt
+    if strategy.position_size > 0
         strategy.close("Long", comment="2PM Flatten")
-    if strategy.position_size < 0 and not trailing and not na(tradeEntryPx) and close < tradeEntryPx
+    if strategy.position_size < 0
         strategy.close("Short", comment="2PM Flatten")
     flattenedAt2Pm := true
 
+// Partial at R:R via market close (never a limit order — keeps stop on full size until filled)
 if exitsArmed and canPartial and not na(tradePartialPx)
-    if strategy.position_size > 0
-        strategy.exit("Long Partial", "Long", limit=tradePartialPx, qty=partialQty, comment="0.5R Partial")
-    if strategy.position_size < 0
-        strategy.exit("Short Partial", "Short", limit=tradePartialPx, qty=partialQty, comment="0.5R Partial")
+    if strategy.position_size > 0 and high >= tradePartialPx and low > tradeStopPx
+        strategy.close("Long", qty=partialQty, comment=str.tostring(partialExitRr, "#.#") + "R Partial")
+        partialTaken := true
+    if strategy.position_size < 0 and low <= tradePartialPx and high < tradeStopPx
+        strategy.close("Short", qty=partialQty, comment=str.tostring(partialExitRr, "#.#") + "R Partial")
+        partialTaken := true
 
-if exitsArmed and not partialTaken and math.abs(strategy.position_size) < tradeQty
-    partialTaken := true
-
+// Full-size stop + TP bracket (no qty split — stop always closes entire open position)
 if exitsArmed and not trailing
     if strategy.position_size > 0
-        strategy.exit("Long SL", "Long", stop=tradeStopPx, comment="Stop Loss")
-        strategy.exit("Long TP", "Long", limit=tradeTpPx, comment="3:1 TP")
+        strategy.exit("Long Bracket", "Long", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
     if strategy.position_size < 0
-        strategy.exit("Short SL", "Short", stop=tradeStopPx, comment="Stop Loss")
-        strategy.exit("Short TP", "Short", limit=tradeTpPx, comment="3:1 TP")
+        strategy.exit("Short Bracket", "Short", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
 
 if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEntryBar
     tradeEntryBar := na
@@ -553,6 +564,7 @@ if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEn
 if exitsArmed and strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk)
     if not trailing and high >= tradeEntryPx + tradeRisk * trailActivateRr
         trailing := true
+        strategy.cancel("Long Bracket")
     if trailing
         swingLow = low
         for i = 1 to trailLookback - 1
@@ -560,11 +572,12 @@ if exitsArmed and strategy.position_size > 0 and not na(tradeEntryPx) and not na
         newTrail = swingLow - stopBuf
         if na(trailStop) or newTrail > trailStop
             trailStop := newTrail
-        strategy.exit("Long SL", "Long", stop=trailStop, comment="Trail Stop")
+        strategy.exit("Long Trail", "Long", stop=trailStop, comment="Trail Stop")
 
 if exitsArmed and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
     if not trailing and low <= tradeEntryPx - tradeRisk * trailActivateRr
         trailing := true
+        strategy.cancel("Short Bracket")
     if trailing
         swingHigh = high
         for i = 1 to trailLookback - 1
@@ -572,13 +585,14 @@ if exitsArmed and strategy.position_size < 0 and not na(tradeEntryPx) and not na
         newTrail = swingHigh + stopBuf
         if na(trailStop) or newTrail < trailStop
             trailStop := newTrail
-        strategy.exit("Short SL", "Short", stop=trailStop, comment="Trail Stop")
+        strategy.exit("Short Trail", "Short", stop=trailStop, comment="Trail Stop")
 
 
 plotshape(useStrategy and longSignal, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small)
 plotshape(useStrategy and shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
 // ── Skip reason text on chart ────────────────────────────────────────────────
-plotshape(longSkipped and inCooldown, "Skip: Cooldown", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
+plotshape(longSkipped and dailyLossCapHit, "Skip: Daily cap L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Daily cap")
+plotshape(longSkipped and not dailyLossCapHit and inCooldown, "Skip: Cooldown", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
 plotshape(longSkipped and not inCooldown and strategy.position_size != 0, "Skip: In pos", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="In position")
 plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="1 trade/day")
 plotshape(longSkipped and not inCooldown and strategy.position_size == 0 and not beforeEntryCutoff, "Skip: Cutoff", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="After cutoff")
@@ -588,7 +602,8 @@ plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and 
 plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and not withinVwapDistLong, "Skip: Far VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Far VWAP")
 plotshape(longFilterSkip and not inCooldown and strategy.position_size == 0 and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and not validLongRisk, "Skip: Wide stop L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Wide stop")
 
-plotshape(shortSkipped and inCooldown, "Skip: Cooldown S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
+plotshape(shortSkipped and dailyLossCapHit, "Skip: Daily cap S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Daily cap")
+plotshape(shortSkipped and not dailyLossCapHit and inCooldown, "Skip: Cooldown S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="Cooldown")
 plotshape(shortSkipped and not inCooldown and strategy.position_size != 0, "Skip: In pos S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="In position")
 plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="1 trade/day")
 plotshape(shortSkipped and not inCooldown and strategy.position_size == 0 and not beforeEntryCutoff, "Skip: Cutoff S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, text="After cutoff")
