@@ -50,7 +50,7 @@ def load_tv_trades(path: Path) -> pd.DataFrame:
             rename[col] = "price"
         elif "position size (qty)" in col or col == "qty":
             rename[col] = "qty"
-        elif col.startswith("p&l usd") or col == "pnl":
+        elif col.startswith("p&l usd") or col == "pnl" or col == "net pnl usd":
             rename[col] = "pnl"
         elif col == "type":
             rename[col] = "type"
