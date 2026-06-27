@@ -27,6 +27,67 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Web backtester (React + Vite)
+
+TradingView-style UI for dropping Pine Script strategies and running backtests across date ranges.
+
+### Setup
+
+```bash
+# Backend API (from repo root)
+python3 -m venv api/.venv
+source api/.venv/bin/activate
+pip install -r api/requirements.txt -r requirements.txt
+
+# Frontend
+cd web && npm install
+```
+
+### Run
+
+Both API and UI in one terminal:
+
+```bash
+./scripts/dev.sh
+```
+
+Or run separately:
+
+```bash
+./scripts/run-api.sh   # http://127.0.0.1:8000
+./scripts/run-web.sh   # http://localhost:5173
+```
+
+Open http://localhost:5173, drop your `.pine` file (e.g. `tradingview/Session_Levels_Strategy.pine`), pick a range, and click **Run backtest**.
+
+### Date ranges
+
+| Range | Data interval | Notes |
+|-------|---------------|-------|
+| Last 7 days | 5m | |
+| Last 30 days | 5m | |
+| Last 90 days | 1h | yfinance intraday cap is ~60 days |
+| This year | 1h | |
+| Last year | 1d | |
+| All time | 1d | |
+
+### Pine Script execution
+
+**Session Levels** (`tradingview/Session_Levels_Strategy.pine`) has a Python port in `src/session_levels/` that mirrors the Pine entry/exit rules:
+
+- Session + prior-day VWAP cross signals (5m bars, ET/CT session windows)
+- OR wait, fresh cross, opposite-candle filters, flat VWAP skip, cooldowns
+- Stop / partial at 2R / 3R TP / swing trail / 2PM CT flatten / session end
+
+Other Pine strategies still fall back to the FVG engine until ported.
+
+**Alignment notes vs TradingView:**
+
+- Data source is `NQ=F` via yfinance (same index points as MNQ; not identical to `MNQ1!` roll)
+- Confirm TV chart is on **5m** for 7-day comparisons
+- TV stats count **round-trip trades** (partials grouped); the UI matches that
+- Remaining gaps are usually data vendor differences or bar timestamps — export TV's *List of Trades* to diff entry times if needed
+
 ## Run
 
 ```bash

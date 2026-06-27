@@ -85,7 +85,7 @@ def run_backtest(
     assert isinstance(strategy_cfg, StrategyConfig)
 
     equity = bt_cfg.initial_capital
-    equity_points: list[tuple[pd.Timestamp, float]] = [(df.index[0], equity)]
+    equity_points: list[tuple[pd.Timestamp, float]] = []
     ema = df["close"].ewm(span=strategy_cfg.trend_ema_period, adjust=False).mean()
 
     active_setup: PendingSetup | None = None

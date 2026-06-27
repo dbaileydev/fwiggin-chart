@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+:root {
+  --tv-bg: #131722;
+  --tv-panel: #1e222d;
+  --tv-border: #2a2e39;
+  --tv-text: #d1d4dc;
+  --tv-muted: #787b86;
+  --tv-green: #26a69a;
+  --tv-red: #ef5350;
+  --tv-accent: #2962ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, Ubuntu,
+    sans-serif;
+  background: var(--tv-bg);
+  color: var(--tv-text);
+  -webkit-font-smoothing: antialiased;
+}
