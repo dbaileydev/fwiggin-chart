@@ -3,7 +3,7 @@
 strategy("Session Levels", overlay=true,
      max_lines_count=500, max_labels_count=500, max_boxes_count=50,
      initial_capital=50000, currency=currency.USD,
-     calc_on_every_tick=false, process_orders_on_close=true)
+     calc_on_every_tick=true, process_orders_on_close=false)
 
 // ── Session inputs ───────────────────────────────────────────────────────────
 grpSess = "Sessions"
@@ -31,10 +31,6 @@ trailActivateRr = input.float(2, "Trail Activate R:R", minval=0.5, step=0.25, gr
 rrRatio = input.float(3.0, "Risk:Reward (TP)", minval=0.5, step=0.25, group=grpStrat)
 partialExitRr = input.float(2, "Partial Exit R:R", minval=0.25, step=0.25, group=grpStrat)
 partialExitPct = input.float(50.0, "Partial Close %", minval=1, maxval=99, step=1, group=grpStrat)
-usePartialReclaimExit = input.bool(true, "Exit Runner on Partial Reclaim", group=grpStrat,
-     tooltip="After partial fills, wait N grace bars then exit the runner if a bar closes back through the partial R:R level. Disables trailing on the runner.")
-partialReclaimGraceBars = input.int(1, "Partial Reclaim Grace (bars)", minval=0, group=grpStrat,
-     tooltip="Bars after the partial-exit bar before reclaim applies. 0 = check the very next bar. 1 = one full grace candle after partial.")
 waitForOr = input.bool(true, "Wait For OR Completion", group=grpStrat,
      tooltip="Only trade after the opening range period ends.")
 entryStartHourEt = input.int(10, "No Entries Before Hour (ET)", minval=0, maxval=23, group=grpStrat)
@@ -61,7 +57,7 @@ useDailyLossCap = input.bool(true, "Daily Loss Cap", group=grpStrat,
 maxDailyLossUsd = input.float(1200, "Max Daily Loss (USD)", minval=0, step=50, group=grpStrat,
      tooltip="No new entries after session loss exceeds this amount. Set to 0 to disable.")
 grpDefense = "Defensive Mode"
-useDefensiveMode = input.bool(true, "Enable Defensive Mode", group=grpDefense,
+useDefensiveMode = input.bool(false, "Enable Defensive Mode", group=grpDefense,
      tooltip="After consecutive losing days, reduce size and limit to 1 trade/day until consecutive winning days.")
 defensiveLossDays = input.int(2, "Loss Days to Activate", minval=1, group=grpDefense,
      tooltip="Consecutive losing traded days to enter defensive mode.")
@@ -415,7 +411,6 @@ var float tradeStopPx = na
 var float tradeTpPx = na
 var float tradePartialPx = na
 var bool partialTaken = false
-var int partialTakenBar = na
 
 var float positionStartNetProfit = na
 var bool inDefensive = false
@@ -453,7 +448,6 @@ if rthStarted
     tradeTpPx := na
     tradePartialPx := na
     partialTaken := false
-    partialTakenBar := na
     positionStartNetProfit := na
     longWinWatchReclaim := false
     shortWinWatchReclaim := false
@@ -665,7 +659,7 @@ tradeBlockReason() =>
     else
         "Blocked"
 
-if canTradeLong and longSignal
+if barstate.isconfirmed and canTradeLong and longSignal
     entryPx = close
     stopPx = low - stopBuf
     risk = longRiskEst
@@ -686,7 +680,7 @@ if canTradeLong and longSignal
         trailStop := na
         ghostActive := false
 
-if canTradeShort and shortSignal
+if barstate.isconfirmed and canTradeShort and shortSignal
     entryPx = close
     stopPx = high + stopBuf
     risk = shortRiskEst
@@ -726,41 +720,21 @@ if flattenAt2Pm and inRth and isTradingDay and not flattenedAt2Pm and barMinsCt 
         strategy.close("Short", comment="2PM Flatten")
     flattenedAt2Pm := true
 
-// Partial at R:R via market close (never a limit order — keeps stop on full size until filled)
-if exitsArmed and canPartial and not na(tradePartialPx)
+// Partial at R:R intrabar (strategy.close — no qty-split exit order that steals stop size)
+partialComment = str.tostring(activePartialRr, "#.#") + "R Partial"
+if exitsArmed and canPartial and not na(tradePartialPx) and not trailing
     if strategy.position_size > 0 and high >= tradePartialPx and low > tradeStopPx
-        strategy.close("Long", qty=partialQty, comment=str.tostring(partialExitRr, "#.#") + "R Partial")
+        strategy.close("Long", qty=partialQty, comment=partialComment)
         partialTaken := true
-        partialTakenBar := bar_index
-        trailing := false
-        strategy.cancel("Long Trail")
     if strategy.position_size < 0 and low <= tradePartialPx and high < tradeStopPx
-        strategy.close("Short", qty=partialQty, comment=str.tostring(partialExitRr, "#.#") + "R Partial")
+        strategy.close("Short", qty=partialQty, comment=partialComment)
         partialTaken := true
-        partialTakenBar := bar_index
-        trailing := false
-        strategy.cancel("Short Trail")
 
-// After partial bar + grace: close runner if bar closes back through partial R:R (no trailing on runner)
-partialReclaimReady = usePartialReclaimExit and partialTaken and not na(partialTakenBar) and not na(tradePartialPx) and bar_index > partialTakenBar + partialReclaimGraceBars
-longPartialReclaim = partialReclaimReady and strategy.position_size > 0 and close < tradePartialPx
-shortPartialReclaim = partialReclaimReady and strategy.position_size < 0 and close > tradePartialPx
-inPartialGrace = partialTaken and not partialReclaimReady
-
-// Runner bracket — after grace, floor stop at partial R:R instead of original stop
-if exitsArmed and not trailing and strategy.position_size > 0
-    if partialReclaimReady
-        strategy.exit("Long Runner", "Long", stop=tradePartialPx, limit=tradeTpPx, comment="Partial Floor")
-    else if not partialTaken
+// Full-size stop + TP bracket (no qty — always covers entire open position)
+if exitsArmed and not trailing
+    if strategy.position_size > 0
         strategy.exit("Long Bracket", "Long", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
-    else if inPartialGrace
-        strategy.exit("Long Bracket", "Long", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
-if exitsArmed and not trailing and strategy.position_size < 0
-    if partialReclaimReady
-        strategy.exit("Short Runner", "Short", stop=tradePartialPx, limit=tradeTpPx, comment="Partial Floor")
-    else if not partialTaken
-        strategy.exit("Short Bracket", "Short", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
-    else if inPartialGrace
+    if strategy.position_size < 0
         strategy.exit("Short Bracket", "Short", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
 
 if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEntryBar
@@ -771,14 +745,12 @@ if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEn
     tradeTpPx := na
     tradePartialPx := na
     partialTaken := false
-    partialTakenBar := na
 
-// ── Swing trailing stop (activates at trail R:R) — disabled once partial is taken ──
-if exitsArmed and not partialTaken and strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk) and not longPartialReclaim
+// ── Swing trailing stop (activates at trail R:R) ───────────────────────────
+if exitsArmed and strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk)
     if not trailing and high >= tradeEntryPx + tradeRisk * activeTrailRr
         trailing := true
         strategy.cancel("Long Bracket")
-        strategy.cancel("Long Runner")
     if trailing
         swingLow = low
         for i = 1 to trailLookback - 1
@@ -788,11 +760,10 @@ if exitsArmed and not partialTaken and strategy.position_size > 0 and not na(tra
             trailStop := newTrail
         strategy.exit("Long Trail", "Long", stop=trailStop, comment="Trail Stop")
 
-if exitsArmed and not partialTaken and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk) and not shortPartialReclaim
+if exitsArmed and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
     if not trailing and low <= tradeEntryPx - tradeRisk * activeTrailRr
         trailing := true
         strategy.cancel("Short Bracket")
-        strategy.cancel("Short Runner")
     if trailing
         swingHigh = high
         for i = 1 to trailLookback - 1
@@ -801,17 +772,6 @@ if exitsArmed and not partialTaken and strategy.position_size < 0 and not na(tra
         if na(trailStop) or newTrail < trailStop
             trailStop := newTrail
         strategy.exit("Short Trail", "Short", stop=trailStop, comment="Trail Stop")
-
-if exitsArmed and longPartialReclaim
-    strategy.cancel("Long Bracket")
-    strategy.cancel("Long Runner")
-    strategy.cancel("Long Trail")
-    strategy.close("Long", comment="Partial Reclaim")
-if exitsArmed and shortPartialReclaim
-    strategy.cancel("Short Bracket")
-    strategy.cancel("Short Runner")
-    strategy.cancel("Short Trail")
-    strategy.close("Short", comment="Partial Reclaim")
 
 
 plotshape(enteredLongThisBar, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small, display=display.all - display.status_line)

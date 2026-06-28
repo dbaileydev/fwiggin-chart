@@ -404,7 +404,7 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
 
                 if pos.trailing:
                     if side == "long":
-                        swing = min(l[i - k] for k in range(min(cfg.trail_lookback, i + 1)))
+                        swing = min(l[i - k] for k in range(min(int(cfg.trail_lookback), i + 1)))
                         new_trail = swing - stop_buf
                         if pos.trail_stop is None or new_trail > pos.trail_stop:
                             pos.trail_stop = new_trail
@@ -416,7 +416,7 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
                             sess.last_long_exit_bar = i
                             pos = None
                     else:
-                        swing = max(h[i - k] for k in range(min(cfg.trail_lookback, i + 1)))
+                        swing = max(h[i - k] for k in range(min(int(cfg.trail_lookback), i + 1)))
                         new_trail = swing + stop_buf
                         if pos.trail_stop is None or new_trail < pos.trail_stop:
                             pos.trail_stop = new_trail
