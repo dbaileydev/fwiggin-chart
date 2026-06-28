@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .calendar import is_trading_day
+from .candlestick import align_long, align_short
 from .config import SessionLevelsConfig
 
 
@@ -350,14 +351,31 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
                         sess.last_short_exit_bar = i
                     exited = True
 
-            if pos is not None and not pos.trailing:
-                stop_hit = (side == "long" and l[i] <= pos.stop_px) or (side == "short" and h[i] >= pos.stop_px)
-                tp_hit = (side == "long" and h[i] >= pos.tp_px) or (side == "short" and l[i] <= pos.tp_px)
+            if pos is not None and not exited:
+                side = pos.side
 
+                # Update swing trail level when already trailing
+                if pos.trailing:
+                    if side == "long":
+                        swing = min(l[i - k] for k in range(min(int(cfg.trail_lookback), i + 1)))
+                        new_trail = swing - stop_buf
+                        if pos.trail_stop is None or new_trail > pos.trail_stop:
+                            pos.trail_stop = new_trail
+                    else:
+                        swing = max(h[i - k] for k in range(min(int(cfg.trail_lookback), i + 1)))
+                        new_trail = swing + stop_buf
+                        if pos.trail_stop is None or new_trail < pos.trail_stop:
+                            pos.trail_stop = new_trail
+
+                active_stop = pos.trail_stop if pos.trailing and pos.trail_stop is not None else pos.stop_px
+
+                # 1) Stop / trail — exit full remaining size intrabar
+                stop_hit = (side == "long" and l[i] <= active_stop) or (side == "short" and h[i] >= active_stop)
                 if stop_hit:
+                    reason = ExitReason.TRAIL if pos.trailing else ExitReason.STOP
                     close_leg(
-                        side, pos.entry_px, pos.entry_time, pos.stop_px, ts, pos.qty,
-                        ExitReason.STOP, i,
+                        side, pos.entry_px, pos.entry_time, active_stop, ts, pos.qty,
+                        reason, i,
                     )
                     if side == "long":
                         sess.last_long_exit_bar = i
@@ -365,6 +383,8 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
                         sess.last_short_exit_bar = i
                     pos = None
                     exited = True
+
+                # 2) Partial at 2R (before trail activates on this bar)
                 elif (
                     not pos.partial_taken
                     and partial_qty >= 1
@@ -384,49 +404,31 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
                         )
                         pos.qty -= partial_qty
                         pos.partial_taken = True
-                elif tp_hit:
-                    close_leg(
-                        side, pos.entry_px, pos.entry_time, pos.tp_px, ts, pos.qty,
-                        ExitReason.TARGET, i,
-                    )
-                    if side == "long":
-                        sess.last_long_exit_bar = i
-                    else:
-                        sess.last_short_exit_bar = i
-                    pos = None
-                    exited = True
 
-            if pos is not None and not exited:
-                if side == "long" and not pos.trailing and h[i] >= pos.entry_px + pos.risk * cfg.trail_activate_rr:
-                    pos.trailing = True
-                elif side == "short" and not pos.trailing and l[i] <= pos.entry_px - pos.risk * cfg.trail_activate_rr:
-                    pos.trailing = True
-
-                if pos.trailing:
-                    if side == "long":
+                # 3) Activate trail on runner at trail R:R
+                if pos is not None and not pos.trailing:
+                    if side == "long" and h[i] >= pos.entry_px + pos.risk * cfg.trail_activate_rr:
+                        pos.trailing = True
                         swing = min(l[i - k] for k in range(min(int(cfg.trail_lookback), i + 1)))
-                        new_trail = swing - stop_buf
-                        if pos.trail_stop is None or new_trail > pos.trail_stop:
-                            pos.trail_stop = new_trail
-                        if l[i] <= pos.trail_stop:
-                            close_leg(
-                                side, pos.entry_px, pos.entry_time, pos.trail_stop, ts, pos.qty,
-                                ExitReason.TRAIL, i,
-                            )
-                            sess.last_long_exit_bar = i
-                            pos = None
-                    else:
+                        pos.trail_stop = swing - stop_buf
+                    elif side == "short" and l[i] <= pos.entry_px - pos.risk * cfg.trail_activate_rr:
+                        pos.trailing = True
                         swing = max(h[i - k] for k in range(min(int(cfg.trail_lookback), i + 1)))
-                        new_trail = swing + stop_buf
-                        if pos.trail_stop is None or new_trail < pos.trail_stop:
-                            pos.trail_stop = new_trail
-                        if h[i] >= pos.trail_stop:
-                            close_leg(
-                                side, pos.entry_px, pos.entry_time, pos.trail_stop, ts, pos.qty,
-                                ExitReason.TRAIL, i,
-                            )
+                        pos.trail_stop = swing + stop_buf
+
+                # 4) Hard TP at 3R while pre-trail
+                if pos is not None and not exited and not pos.trailing:
+                    tp_hit = (side == "long" and h[i] >= pos.tp_px) or (side == "short" and l[i] <= pos.tp_px)
+                    if tp_hit:
+                        close_leg(
+                            side, pos.entry_px, pos.entry_time, pos.tp_px, ts, pos.qty,
+                            ExitReason.TARGET, i,
+                        )
+                        if side == "long":
+                            sess.last_long_exit_bar = i
+                        else:
                             sess.last_short_exit_bar = i
-                            pos = None
+                        pos = None
 
         # Win-watch after directional exit
         if pos is None and sess.last_long_exit_bar == i and sess.position_start_equity is not None:
@@ -567,11 +569,11 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
 
         long_core = (
             long_setup and fresh_long and within_dist_long and valid_long_risk
-            and not prior_opp_short and not both_flat
+            and not prior_opp_short and not both_flat and align_long(o, h, l, c, i, cfg)
         )
         short_core = (
             short_setup and fresh_short and within_dist_short and valid_short_risk
-            and not prior_opp_long and not both_flat
+            and not prior_opp_long and not both_flat and align_short(o, h, l, c, i, cfg)
         )
 
         reclaim_block_long = cfg.use_skip_first_reclaim_after_win and sess.skip_next_long and long_core

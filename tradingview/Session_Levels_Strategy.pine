@@ -88,6 +88,16 @@ entryEndMinuteCt = input.int(0, "No Entries After Minute (CT)", minval=0, maxval
 showSkipLabels = input.bool(true, "Show Skip Reasons", group=grpStrat,
      tooltip="Orange X on skipped signals. Click that bar → Data Window (right panel) shows the skip reason.")
 
+grpCandle = "Candlestick Confirmation"
+useCandleConfirm = input.bool(true, "Require Candle Alignment", group=grpCandle,
+     tooltip="Signal bar must confirm VWAP cross direction via candlestick structure (pin bars, engulfing, conviction close).")
+candlePinWickRatio = input.float(2.0, "Pin Bar Wick / Body Ratio", minval=1.0, step=0.25, group=grpCandle,
+     tooltip="Hammer / shooting star: dominant wick must be at least this multiple of body size.")
+candleMinBodyPct = input.float(0.35, "Marubozu Min Body %", minval=0.1, maxval=0.9, step=0.05, group=grpCandle,
+     tooltip="Full-body candle: body must be at least this fraction of total range.")
+candleClvThreshold = input.float(0.55, "Conviction Close Location", minval=0.5, maxval=0.9, step=0.05, group=grpCandle,
+     tooltip="Long: close in upper fraction of range. Short: close in lower fraction. 0.55 = upper/lower 55%.")
+
 grpVis = "Visuals"
 showOrLines = input.bool(true, "OR High / Low", group=grpVis)
 showOnLines = input.bool(true, "Overnight High / Low (ONH/ONL)", group=grpVis)
@@ -539,6 +549,37 @@ oppFilterShortOn = oppBodyPctShort > 0
 strongBearPrior = oppFilterOn and priorBearish and priorBodyPct >= oppBodyPct
 strongBullPriorShort = oppFilterShortOn and priorBullish and priorBodyPct >= oppBodyPctShort
 
+// ── Candlestick confirmation (signal bar + prior bar) ───────────────────────
+candleRange = high - low
+bodySize = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bodyPct = candleRange > 0 ? bodySize / candleRange : 0.0
+clv = candleRange > 0 ? (close - low) / candleRange : 0.5
+minCandleRange = syminfo.mintick * 8
+
+isBullBar = close > open
+isBearBar = close < open
+isDojiBar = bodyPct <= 0.10
+
+isHammer = candleRange >= minCandleRange and lowerWick >= bodySize * candlePinWickRatio and lowerWick > upperWick * 1.5
+isShootingStar = candleRange >= minCandleRange and upperWick >= bodySize * candlePinWickRatio and upperWick > lowerWick * 1.5
+
+bullEngulf = close[1] < open[1] and close > open and close > open[1] and open <= close[1]
+bearEngulf = close[1] > open[1] and close < open and close < open[1] and open >= close[1]
+
+bullMarubozu = isBullBar and bodyPct >= candleMinBodyPct and upperWick <= bodySize * 0.25 and lowerWick <= bodySize * 0.25
+bearMarubozu = isBearBar and bodyPct >= candleMinBodyPct and upperWick <= bodySize * 0.25 and lowerWick <= bodySize * 0.25
+
+candleConfirmLong = isHammer or bullEngulf or bullMarubozu or (isBullBar and clv >= candleClvThreshold)
+candleOpposeLong = isShootingStar or bearEngulf or isDojiBar or not isBullBar
+
+candleConfirmShort = isShootingStar or bearEngulf or bearMarubozu or (isBearBar and clv <= 1.0 - candleClvThreshold)
+candleOpposeShort = isHammer or bullEngulf or isDojiBar or not isBearBar
+
+candleAlignLong = not useCandleConfirm or (candleConfirmLong and not candleOpposeLong)
+candleAlignShort = not useCandleConfirm or (candleConfirmShort and not candleOpposeShort)
+
 longRiskEst = close - (low - stopBuf)
 shortRiskEst = (high + stopBuf) - close
 
@@ -569,8 +610,8 @@ shortVwapSetup = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelo
 priorOppositeShort = skipAfterOppositeSetup and shortVwapSetup[1]
 priorOppositeLong = skipAfterOppositeSetup and longVwapSetup[1]
 
-longSignalCore = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not bothVwapsFlat
-shortSignalCore = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not bothVwapsFlat
+longSignalCore = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not bothVwapsFlat and candleAlignLong
+shortSignalCore = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not bothVwapsFlat and candleAlignShort
 
 reclaimBlockLong = useSkipFirstReclaimAfterWin and skipNextLongReclaim and longSignalCore
 reclaimBlockShort = useSkipFirstReclaimAfterWin and skipNextShortReclaim and shortSignalCore
@@ -720,9 +761,38 @@ if flattenAt2Pm and inRth and isTradingDay and not flattenedAt2Pm and barMinsCt 
         strategy.close("Short", comment="2PM Flatten")
     flattenedAt2Pm := true
 
-// Partial at R:R intrabar (strategy.close — no qty-split exit order that steals stop size)
+// ── Exit pipeline: stop (all remaining) → 2R partial → trail activate → TP ──
+// Update swing trail level only after trailing is already active
+if exitsArmed and trailing and strategy.position_size > 0 and not na(tradeEntryPx)
+    swingLow = low
+    for j = 1 to trailLookback - 1
+        swingLow := math.min(swingLow, low[j])
+    newTrail = swingLow - stopBuf
+    if na(trailStop) or newTrail > trailStop
+        trailStop := newTrail
+
+if exitsArmed and trailing and strategy.position_size < 0 and not na(tradeEntryPx)
+    swingHigh = high
+    for j = 1 to trailLookback - 1
+        swingHigh := math.max(swingHigh, high[j])
+    newTrail = swingHigh + stopBuf
+    if na(trailStop) or newTrail < trailStop
+        trailStop := newTrail
+
+activeStopPx = trailing and not na(trailStop) ? trailStop : tradeStopPx
+
+// 1) Stop / trail — close ALL open contracts immediately when stop is touched
+if exitsArmed and not na(activeStopPx)
+    if strategy.position_size > 0 and low <= activeStopPx
+        strategy.cancel("Long TP")
+        strategy.close("Long", comment=trailing ? "Trail Stop" : "Stop Loss")
+    if strategy.position_size < 0 and high >= activeStopPx
+        strategy.cancel("Short TP")
+        strategy.close("Short", comment=trailing ? "Trail Stop" : "Stop Loss")
+
+// 2) Partial at 2R (runner stays on for trail — checked before trail activates this bar)
 partialComment = str.tostring(activePartialRr, "#.#") + "R Partial"
-if exitsArmed and canPartial and not na(tradePartialPx) and not trailing
+if exitsArmed and canPartial and not na(tradePartialPx)
     if strategy.position_size > 0 and high >= tradePartialPx and low > tradeStopPx
         strategy.close("Long", qty=partialQty, comment=partialComment)
         partialTaken := true
@@ -730,12 +800,30 @@ if exitsArmed and canPartial and not na(tradePartialPx) and not trailing
         strategy.close("Short", qty=partialQty, comment=partialComment)
         partialTaken := true
 
-// Full-size stop + TP bracket (no qty — always covers entire open position)
+// 3) Activate swing trail on runner at trail R:R (default 2R — after partial can fill)
+if exitsArmed and not trailing and strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk)
+    if high >= tradeEntryPx + tradeRisk * activeTrailRr
+        trailing := true
+        strategy.cancel("Long TP")
+        swingLow = low
+        for j = 1 to trailLookback - 1
+            swingLow := math.min(swingLow, low[j])
+        trailStop := swingLow - stopBuf
+if exitsArmed and not trailing and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
+    if low <= tradeEntryPx - tradeRisk * activeTrailRr
+        trailing := true
+        strategy.cancel("Short TP")
+        swingHigh = high
+        for j = 1 to trailLookback - 1
+            swingHigh := math.max(swingHigh, high[j])
+        trailStop := swingHigh + stopBuf
+
+// 4) Hard TP at 3R while still pre-trail (optional cap before runner trails)
 if exitsArmed and not trailing
     if strategy.position_size > 0
-        strategy.exit("Long Bracket", "Long", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
+        strategy.exit("Long TP", "Long", limit=tradeTpPx, comment="Take Profit")
     if strategy.position_size < 0
-        strategy.exit("Short Bracket", "Short", stop=tradeStopPx, limit=tradeTpPx, comment="Stop Loss")
+        strategy.exit("Short TP", "Short", limit=tradeTpPx, comment="Take Profit")
 
 if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEntryBar
     tradeEntryBar := na
@@ -745,34 +833,6 @@ if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEn
     tradeTpPx := na
     tradePartialPx := na
     partialTaken := false
-
-// ── Swing trailing stop (activates at trail R:R) ───────────────────────────
-if exitsArmed and strategy.position_size > 0 and not na(tradeEntryPx) and not na(tradeRisk)
-    if not trailing and high >= tradeEntryPx + tradeRisk * activeTrailRr
-        trailing := true
-        strategy.cancel("Long Bracket")
-    if trailing
-        swingLow = low
-        for i = 1 to trailLookback - 1
-            swingLow := math.min(swingLow, low[i])
-        newTrail = swingLow - stopBuf
-        if na(trailStop) or newTrail > trailStop
-            trailStop := newTrail
-        strategy.exit("Long Trail", "Long", stop=trailStop, comment="Trail Stop")
-
-if exitsArmed and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
-    if not trailing and low <= tradeEntryPx - tradeRisk * activeTrailRr
-        trailing := true
-        strategy.cancel("Short Bracket")
-    if trailing
-        swingHigh = high
-        for i = 1 to trailLookback - 1
-            swingHigh := math.max(swingHigh, high[i])
-        newTrail = swingHigh + stopBuf
-        if na(trailStop) or newTrail < trailStop
-            trailStop := newTrail
-        strategy.exit("Short Trail", "Short", stop=trailStop, comment="Trail Stop")
-
 
 plotshape(enteredLongThisBar, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small, display=display.all - display.status_line)
 plotshape(enteredShortThisBar, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small, display=display.all - display.status_line)
@@ -797,6 +857,7 @@ plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not i
 plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and priorOppositeShort, "Skip: Opp setup L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Opp setup")
 plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and not withinVwapDistLong, "Skip: Far VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Far VWAP")
 plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and not validLongRisk, "Skip: Wide stop L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wide stop")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not reclaimBlockLong and not bothVwapsFlat and useCandleConfirm and not candleAlignLong, "Skip: Bad candle L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Bad candle")
 
 plotshape(shortSkipped and strategy.position_size != 0, "Skip: In pos S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="In position")
 plotshape(shortSkipped and strategy.position_size == 0 and dailyLossCapHit, "Skip: Daily cap S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Daily cap")
@@ -813,6 +874,7 @@ plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not
 plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and priorOppositeLong, "Skip: Opp setup S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Opp setup")
 plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and not withinVwapDistShort, "Skip: Far VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Far VWAP")
 plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and not validShortRisk, "Skip: Wide stop S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wide stop")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not reclaimBlockShort and not bothVwapsFlat and useCandleConfirm and not candleAlignShort, "Skip: Bad candle S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Bad candle")
 
 // PnL label on trade exit
 var int prevClosedTrades = 0

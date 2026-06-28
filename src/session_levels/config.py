@@ -41,6 +41,10 @@ class SessionLevelsConfig:
     max_vwap_spread_pts: float = 20.0
     max_vwap_slope_pts: float = 15.0
     max_entry_risk_pts: float = 80.0
+    use_candle_confirm: bool = True
+    candle_pin_wick_ratio: float = 2.0
+    candle_min_body_pct: float = 0.35
+    candle_clv_threshold: float = 0.55
     skip_us_holidays: bool = True
     skip_fomc_days: bool = True
     tick_size: float = 0.25
