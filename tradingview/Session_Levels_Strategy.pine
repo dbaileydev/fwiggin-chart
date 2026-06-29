@@ -57,24 +57,24 @@ useLossStreakDefense = input.bool(true, "Enable Loss Streak Defense", group=grpD
      tooltip="After consecutive losing trades, pause entries or trade reduced size until defense clears.")
 lossStreakMode = input.string("Pause", "Loss Streak Action", options=["Pause", "Reduce Size"], group=grpDefense,
      tooltip="Pause: no live entries until a paper trade wins. Reduce Size: keep trading at Defense Contracts until a live win.")
-streakLossTrades = input.int(3, "Loss Trades to Activate", minval=1, group=grpDefense,
+streakLossTrades = input.int(4, "Loss Trades to Activate", minval=1, group=grpDefense,
      tooltip="Consecutive losing closed trades before defense mode activates.")
-streakWinTrades = input.int(1, "Wins to Resume Full Size", minval=1, group=grpDefense,
+streakWinTrades = input.int(2, "Wins to Resume Full Size", minval=1, group=grpDefense,
      tooltip="Reduce Size: consecutive winning closed trades to return to full Contracts.")
-defenseContracts = input.int(3, "Defense Contracts", minval=1, group=grpDefense,
+defenseContracts = input.int(1, "Defense Contracts", minval=1, group=grpDefense,
      tooltip="Live contract size while in Reduce Size defense mode.")
 pauseSimWinRr = input.float(2, "Paper Win R:R", minval=0.25, step=0.25, group=grpDefense,
      tooltip="Pause mode only: paper trade must reach this R:R before stop to resume full size.")
-pauseStopBufferTicks = input.int(15, "Paper Stop Buffer (ticks)", minval=0, group=grpDefense,
+pauseStopBufferTicks = input.int(2, "Paper Stop Buffer (ticks)", minval=0, group=grpDefense,
      tooltip="Pause mode only: stop buffer for paper trades. Does not affect Live Stop Buffer (ticks).")
 
-maxVwapDistPts = input.float(50.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
+maxVwapDistPts = input.float(100.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Skip if entry close is farther than this from session VWAP. Set to 0 to disable.")
 skipFlatVwaps = input.bool(true, "Skip When VWAPs Flat / Compressed", group=grpStrat,
      tooltip="No entries when session + prior-day VWAP are close together and not sloping (chop).")
 vwapSlopeLookback = input.int(6, "VWAP Flat Lookback (bars)", minval=1, group=grpStrat,
      tooltip="Bars to measure VWAP movement. 6 bars = 30 min on a 5m chart.")
-minVwapSpreadPts = input.float(15.0, "Min VWAP Spread (pts)", minval=0, step=5.0, group=grpStrat,
+minVwapSpreadPts = input.float(2.0, "Min VWAP Spread (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Require session and prior-day VWAP to be at least this far apart. Blocks early-session chop when VWAPs sit on top of each other. Set to 0 to disable.")
 maxVwapSpreadPts = input.float(20.0, "Max VWAP Spread (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Session and prior-day VWAP must be farther apart than this. Both within = compressed chop.")

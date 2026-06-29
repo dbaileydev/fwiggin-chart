@@ -10,7 +10,7 @@ class SessionLevelsConfig:
     trade_qty: int = 6
     one_trade_per_day: bool = False
     stop_buffer_ticks: int = 2  # live entries, stops, trail
-    pause_stop_buffer_ticks: int = 15  # paper trades while paused
+    pause_stop_buffer_ticks: int = 2  # paper trades while paused
     trail_lookback: int = 3
     trail_activate_rr: float = 2.0
     rr_ratio: float = 3.0
@@ -32,12 +32,12 @@ class SessionLevelsConfig:
     flatten_end_minute_ct: int = 0
     use_loss_streak_defense: bool = True
     loss_streak_mode: str = "pause"  # "pause" | "reduce_size"
-    streak_loss_trades: int = 3
-    streak_win_trades: int = 1
-    defense_contracts: int = 3
+    streak_loss_trades: int = 4
+    streak_win_trades: int = 2
+    defense_contracts: int = 1
     pause_sim_win_rr: float = 2.0
-    max_vwap_dist_pts: float = 50.0
-    min_vwap_spread_pts: float = 15.0
+    max_vwap_dist_pts: float = 100.0
+    min_vwap_spread_pts: float = 2.0
     skip_flat_vwaps: bool = True
     vwap_slope_lookback: int = 6
     max_vwap_spread_pts: float = 20.0
