@@ -149,9 +149,9 @@ def build_single_param_grids() -> list[dict]:
             combos.append(o)
     # bool toggles
     for param in [
-        "wait_for_or", "use_skip_first_reclaim_after_win", "use_ghost_fail_cooldown",
-        "skip_after_opposite_setup", "skip_flat_vwaps", "require_fresh_cross",
-        "flatten_at_2pm", "use_daily_loss_cap", "one_trade_per_day",
+        "wait_for_or", "use_skip_first_reclaim_after_win",
+        "skip_flat_vwaps",
+        "flatten_at_2pm", "one_trade_per_day",
     ]:
         for v in [True, False]:
             combos.append({param: v})

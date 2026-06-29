@@ -42,23 +42,15 @@ sameDirCooldown = input.int(20, "Same Direction Cooldown (bars)", minval=0, grou
      tooltip="After any long/short closes, wait N bars before another entry in that same direction.")
 useSkipFirstReclaimAfterWin = input.bool(true, "Skip First Reclaim After Win", group=grpStrat,
      tooltip="After a winning long, if price closes back below session VWAP then crosses above again, skip the first new long signal (mirror for shorts above VWAP).")
-useGhostFailCooldown = input.bool(false, "Cooldown After Failed Skipped Setup", group=grpStrat,
-     tooltip="Paper-track filter-blocked VWAP setups. If the hypothetical stop is hit, wait half the loss cooldown before another entry in the same direction.")
 oppBodyPct = input.float(0.60, "Long Opposite Candle Body %", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
      tooltip="Skip long if prior bar is strong bearish (body >= this % of range). Set to 0 to disable.")
 oppBodyPctShort = input.float(0.70, "Short Opposite Candle Body %", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
      tooltip="Skip short if prior bar is strong bullish (body >= this % of range). Set to 0 to disable.")
-skipAfterOppositeSetup = input.bool(true, "Skip After Opposite Setup", group=grpStrat,
-     tooltip="No entry if the prior bar had a VWAP cross setup in the opposite direction.")
 flattenAt2Pm = input.bool(true, "Flatten All at 2PM CT", group=grpStrat,
      tooltip="At 2PM CT, close all open positions (winners, losers, and trailing).")
-useDailyLossCap = input.bool(true, "Daily Loss Cap", group=grpStrat,
-     tooltip="Block new entries once session PnL (realized + open) reaches max daily loss.")
-maxDailyLossUsd = input.float(1200, "Max Daily Loss (USD)", minval=0, step=50, group=grpStrat,
-     tooltip="No new entries after session loss exceeds this amount. Set to 0 to disable.")
 grpDefense = "Defensive Mode"
 useDefensiveMode = input.bool(false, "Enable Defensive Mode", group=grpDefense,
-     tooltip="After consecutive losing days, reduce size and limit to 1 trade/day until consecutive winning days.")
+     tooltip="After consecutive losing days, use defensive partial/trail R:R until consecutive winning days.")
 defensiveLossDays = input.int(2, "Loss Days to Activate", minval=1, group=grpDefense,
      tooltip="Consecutive losing traded days to enter defensive mode.")
 defensiveWinDays = input.int(2, "Win Days to Deactivate", minval=1, group=grpDefense,
@@ -68,14 +60,14 @@ defensivePartialRr = input.float(1, "Defensive Partial R:R", minval=0.25, step=0
 defensiveTrailRr = input.float(1, "Defensive Trail R:R", minval=0.5, step=0.25, group=grpDefense,
      tooltip="Start trailing sooner when defensive. Normal uses the main Trail Activate R:R.")
 
-requireFreshCross = input.bool(true, "Require Fresh VWAP Cross", group=grpStrat,
-     tooltip="Prior bar must not already be fully above/below both VWAPs. Blocks chase entries.")
 maxVwapDistPts = input.float(50.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Skip if entry close is farther than this from session VWAP. Set to 0 to disable.")
 skipFlatVwaps = input.bool(true, "Skip When VWAPs Flat / Compressed", group=grpStrat,
      tooltip="No entries when session + prior-day VWAP are close together and not sloping (chop).")
 vwapSlopeLookback = input.int(6, "VWAP Flat Lookback (bars)", minval=1, group=grpStrat,
      tooltip="Bars to measure VWAP movement. 6 bars = 30 min on a 5m chart.")
+minVwapSpreadPts = input.float(15.0, "Min VWAP Spread (pts)", minval=0, step=5.0, group=grpStrat,
+     tooltip="Require session and prior-day VWAP to be at least this far apart. Blocks early-session chop when VWAPs sit on top of each other. Set to 0 to disable.")
 maxVwapSpreadPts = input.float(20.0, "Max VWAP Spread (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Session and prior-day VWAP must be farther apart than this. Both within = compressed chop.")
 maxVwapSlopePts = input.float(15.0, "Max VWAP Slope (pts)", minval=0, step=5.0, group=grpStrat,
@@ -400,13 +392,6 @@ var bool tradedToday = false
 var int lastLossExitBar = na
 var int lastLongExitBar = na
 var int lastShortExitBar = na
-var int lastGhostFailBarLong = na
-var int lastGhostFailBarShort = na
-var bool ghostActive = false
-var float ghostEntryPx = na
-var float ghostStopPx = na
-var float ghostRisk = na
-var int ghostDir = 0
 var bool flattenedAt2Pm = false
 var float sessionStartNetProfit = na
 var float tradeEntryPx = na
@@ -437,13 +422,6 @@ if rthStarted
     lastLossExitBar := na
     lastLongExitBar := na
     lastShortExitBar := na
-    lastGhostFailBarLong := na
-    lastGhostFailBarShort := na
-    ghostActive := false
-    ghostEntryPx := na
-    ghostStopPx := na
-    ghostRisk := na
-    ghostDir := 0
     flattenedAt2Pm := false
     sessionStartNetProfit := strategy.netprofit
     tradeEntryPx := na
@@ -464,9 +442,6 @@ if rthStarted
     skipNextLongReclaim := false
     skipNextShortReclaim := false
 
-if rthEnded and isTradingDay[1]
-    ghostActive := false
-
 // Defensive mode: track consecutive win/loss days at session end
 if rthEnded and isTradingDay[1] and useDefensiveMode and tradedToday
     endedPnl = strategy.netprofit - sessionStartNetProfit
@@ -484,10 +459,9 @@ if rthEnded and isTradingDay[1] and useDefensiveMode and tradedToday
         defLossDays := 0
         defWinDays := 0
 
-// Defensive mode: active quantities and R:R
+// Defensive mode: tighter partial/trail R:R only (size and trade count unchanged)
 defensiveActive = useDefensiveMode and inDefensive
-activeQty = defensiveActive ? int(math.max(1, math.floor(tradeQty / 2.0))) : tradeQty
-activeOneTradePerDay = oneTradePerDay or defensiveActive
+activeQty = tradeQty
 activePartialRr = defensiveActive ? defensivePartialRr : partialExitRr
 activeTrailRr = defensiveActive ? defensiveTrailRr : trailActivateRr
 
@@ -524,10 +498,6 @@ if useSkipFirstReclaimAfterWin and strategy.position_size == 0
 
 inSameDirCooldownLong = sameDirCooldown > 0 and not na(lastLongExitBar) and not na(sessionStartBar) and lastLongExitBar >= sessionStartBar and bar_index - lastLongExitBar < sameDirCooldown
 inSameDirCooldownShort = sameDirCooldown > 0 and not na(lastShortExitBar) and not na(sessionStartBar) and lastShortExitBar >= sessionStartBar and bar_index - lastShortExitBar < sameDirCooldown
-
-sessionRealizedPnl = not na(sessionStartNetProfit) ? strategy.netprofit - sessionStartNetProfit : 0.0
-sessionPnl = sessionRealizedPnl + strategy.openprofit
-dailyLossCapHit = useDailyLossCap and maxDailyLossUsd > 0 and inRth and isTradingDay and sessionPnl <= -maxDailyLossUsd
 
 stopBuf = stopBufferTicks * syminfo.mintick
 
@@ -583,12 +553,6 @@ candleAlignShort = not useCandleConfirm or (candleConfirmShort and not candleOpp
 longRiskEst = close - (low - stopBuf)
 shortRiskEst = (high + stopBuf) - close
 
-wasAboveBoth = not na(sessionVwap[1]) and not na(priorDayVwap[1]) and close[1] > sessionVwap[1] and close[1] > priorDayVwap[1]
-wasBelowBoth = not na(sessionVwap[1]) and not na(priorDayVwap[1]) and close[1] < sessionVwap[1] and close[1] < priorDayVwap[1]
-
-freshLongBreak = not requireFreshCross or not wasAboveBoth
-freshShortBreak = not requireFreshCross or not wasBelowBoth
-
 withinVwapDistLong = maxVwapDistPts <= 0 or (not na(sessionVwap) and close - sessionVwap <= maxVwapDistPts)
 withinVwapDistShort = maxVwapDistPts <= 0 or (not na(sessionVwap) and sessionVwap - close <= maxVwapDistPts)
 
@@ -596,22 +560,20 @@ validLongRisk = maxEntryRiskPts <= 0 or longRiskEst <= maxEntryRiskPts
 validShortRisk = maxEntryRiskPts <= 0 or shortRiskEst <= maxEntryRiskPts
 
 barsSinceSession = not na(sessionStartBar) ? bar_index - sessionStartBar : 0
+vwapSpreadNow = not na(sessionVwap) and not na(priorDayVwap) ? math.abs(sessionVwap - priorDayVwap) : na
+vwapSpreadOk = minVwapSpreadPts <= 0 or (not na(vwapSpreadNow) and vwapSpreadNow >= minVwapSpreadPts)
 canMeasureVwapFlat = barsSinceSession >= vwapSlopeLookback and not na(sessionVwap) and not na(priorDayVwap) and not na(sessionVwap[vwapSlopeLookback]) and not na(priorDayVwap[vwapSlopeLookback])
 sessVwapSlopePts = canMeasureVwapFlat ? math.abs(sessionVwap - sessionVwap[vwapSlopeLookback]) : na
 pdVwapSlopePts = canMeasureVwapFlat ? math.abs(priorDayVwap - priorDayVwap[vwapSlopeLookback]) : na
-vwapSpreadPts = canMeasureVwapFlat ? math.abs(sessionVwap - priorDayVwap) : na
-vwapsCompressed = maxVwapSpreadPts > 0 and vwapSpreadPts <= maxVwapSpreadPts
+vwapsCompressed = maxVwapSpreadPts > 0 and not na(vwapSpreadNow) and vwapSpreadNow <= maxVwapSpreadPts
 vwapsSloping = maxVwapSlopePts > 0 and sessVwapSlopePts <= maxVwapSlopePts and pdVwapSlopePts <= maxVwapSlopePts
 bothVwapsFlat = skipFlatVwaps and canMeasureVwapFlat and vwapsCompressed and vwapsSloping
 
 longVwapSetup = canEnter and aboveBothVwap and (crossAboveSessVwap or crossAbovePdVwap) and not strongBearPrior
 shortVwapSetup = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelowPdVwap) and not strongBullPriorShort
 
-priorOppositeShort = skipAfterOppositeSetup and shortVwapSetup[1]
-priorOppositeLong = skipAfterOppositeSetup and longVwapSetup[1]
-
-longSignalCore = longVwapSetup and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not bothVwapsFlat and candleAlignLong
-shortSignalCore = shortVwapSetup and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not bothVwapsFlat and candleAlignShort
+longSignalCore = longVwapSetup and withinVwapDistLong and validLongRisk and vwapSpreadOk and not bothVwapsFlat and candleAlignLong
+shortSignalCore = shortVwapSetup and withinVwapDistShort and validShortRisk and vwapSpreadOk and not bothVwapsFlat and candleAlignShort
 
 reclaimBlockLong = useSkipFirstReclaimAfterWin and skipNextLongReclaim and longSignalCore
 reclaimBlockShort = useSkipFirstReclaimAfterWin and skipNextShortReclaim and shortSignalCore
@@ -624,49 +586,10 @@ if reclaimBlockShort
 longSignal = longSignalCore and not reclaimBlockLong
 shortSignal = shortSignalCore and not reclaimBlockShort
 
-longFilterBlocked = longVwapSetup and not longSignal and longRiskEst > 0
-shortFilterBlocked = shortVwapSetup and not shortSignal and shortRiskEst > 0
+canTradeBase = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday)
 
-canTradeBase = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not activeOneTradePerDay or not tradedToday) and not dailyLossCapHit
-
-// Paper-track filter-blocked setups; half cooldown if hypothetical stop is hit (same direction only)
-if ghostActive and ghostRisk > 0
-    if ghostDir == 1
-        if low <= ghostStopPx
-            lastGhostFailBarLong := bar_index
-            ghostActive := false
-        else if high >= ghostEntryPx + ghostRisk * partialExitRr
-            ghostActive := false
-    else if ghostDir == -1
-        if high >= ghostStopPx
-            lastGhostFailBarShort := bar_index
-            ghostActive := false
-        else if low <= ghostEntryPx - ghostRisk * partialExitRr
-            ghostActive := false
-
-ghostCooldownBars = lossCooldown > 0 ? int(math.max(1, math.floor(lossCooldown / 2.0))) : 0
-inGhostCooldownLong = useGhostFailCooldown and ghostCooldownBars > 0 and not na(lastGhostFailBarLong) and not na(sessionStartBar) and lastGhostFailBarLong >= sessionStartBar and bar_index - lastGhostFailBarLong < ghostCooldownBars
-inGhostCooldownShort = useGhostFailCooldown and ghostCooldownBars > 0 and not na(lastGhostFailBarShort) and not na(sessionStartBar) and lastGhostFailBarShort >= sessionStartBar and bar_index - lastGhostFailBarShort < ghostCooldownBars
-
-willEnterLong = canTradeBase and not inLossCooldown and not inSameDirCooldownLong and not inGhostCooldownLong and longSignal and longRiskEst > 0
-willEnterShort = canTradeBase and not inLossCooldown and not inSameDirCooldownShort and not inGhostCooldownShort and shortSignal and shortRiskEst > 0
-
-if useGhostFailCooldown and not ghostActive and strategy.position_size == 0 and canTradeBase and not inLossCooldown and not willEnterLong and not willEnterShort
-    if shortFilterBlocked
-        ghostActive := true
-        ghostDir := -1
-        ghostEntryPx := close
-        ghostStopPx := high + stopBuf
-        ghostRisk := shortRiskEst
-    else if longFilterBlocked
-        ghostActive := true
-        ghostDir := 1
-        ghostEntryPx := close
-        ghostStopPx := low - stopBuf
-        ghostRisk := longRiskEst
-
-canTradeLong = canTradeBase and not inLossCooldown and not inSameDirCooldownLong and not inGhostCooldownLong
-canTradeShort = canTradeBase and not inLossCooldown and not inSameDirCooldownShort and not inGhostCooldownShort
+canTradeLong = canTradeBase and not inLossCooldown and not inSameDirCooldownLong
+canTradeShort = canTradeBase and not inLossCooldown and not inSameDirCooldownShort
 
 tradeBlockReason() =>
     if not useStrategy
@@ -693,10 +616,6 @@ tradeBlockReason() =>
         "Loss cooldown"
     else if inSameDirCooldownLong or inSameDirCooldownShort
         "Same dir cooldown"
-    else if inGhostCooldownLong or inGhostCooldownShort
-        "Ghost cooldown"
-    else if dailyLossCapHit
-        "Daily loss cap"
     else
         "Blocked"
 
@@ -719,7 +638,6 @@ if barstate.isconfirmed and canTradeLong and longSignal
         partialTaken := false
         trailing := false
         trailStop := na
-        ghostActive := false
 
 if barstate.isconfirmed and canTradeShort and shortSignal
     entryPx = close
@@ -740,7 +658,6 @@ if barstate.isconfirmed and canTradeShort and shortSignal
         partialTaken := false
         trailing := false
         trailStop := na
-        ghostActive := false
 
 enteredLongThisBar = not na(longEntryBar) and longEntryBar == bar_index
 enteredShortThisBar = not na(shortEntryBar) and shortEntryBar == bar_index
@@ -840,41 +757,35 @@ plotshape(enteredShortThisBar, "Short Signal", shape.triangledown, location.abov
 bgcolor(defensiveActive and inRth ? color.new(color.orange, 93) : na, title="Defensive Mode")
 
 // ── Skip reason text on chart ────────────────────────────────────────────────
-canSkipBase = strategy.position_size == 0 and not dailyLossCapHit and not inLossCooldown
+canSkipBase = strategy.position_size == 0 and not inLossCooldown
 
 plotshape(longSkipped and strategy.position_size != 0, "Skip: In pos", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="In position")
-plotshape(longSkipped and strategy.position_size == 0 and dailyLossCapHit, "Skip: Daily cap L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Daily cap")
 plotshape(longSkipped and canSkipBase and inLossCooldown, "Skip: Loss CD L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Cooldown")
 plotshape(longSkipped and canSkipBase and not inLossCooldown and inSameDirCooldownLong, "Skip: Same dir CD L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Re-entry CD")
-plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and inGhostCooldownLong, "Skip: Ghost CD L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Ghost CD")
-plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not inGhostCooldownLong and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
-plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not inGhostCooldownLong and not beforeEntryCutoff, "Skip: Cutoff", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="After cutoff")
-plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not inGhostCooldownLong and not afterEntryStart, "Skip: Early L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Before 10am")
-plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not inGhostCooldownLong and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wait for OR")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and (not waitForOr or afterOrPeriod) and not freshLongBreak, "Skip: Chase L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Chase")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and reclaimBlockLong, "Skip: Reclaim L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Reclaim skip")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not reclaimBlockLong and bothVwapsFlat, "Skip: Flat VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Flat VWAP")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and priorOppositeShort, "Skip: Opp setup L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Opp setup")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and not withinVwapDistLong, "Skip: Far VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Far VWAP")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and not validLongRisk, "Skip: Wide stop L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wide stop")
-plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and not inGhostCooldownLong and beforeEntryCutoff and afterEntryStart and freshLongBreak and withinVwapDistLong and validLongRisk and not priorOppositeShort and not reclaimBlockLong and not bothVwapsFlat and useCandleConfirm and not candleAlignLong, "Skip: Bad candle L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Bad candle")
+plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
+plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not beforeEntryCutoff, "Skip: Cutoff", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="After cutoff")
+plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not afterEntryStart, "Skip: Early L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Before 10am")
+plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wait for OR")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and beforeEntryCutoff and afterEntryStart and withinVwapDistLong and validLongRisk and reclaimBlockLong, "Skip: Reclaim L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Reclaim skip")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and beforeEntryCutoff and afterEntryStart and withinVwapDistLong and validLongRisk and not reclaimBlockLong and not vwapSpreadOk, "Skip: Tight spread L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Tight spread")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and beforeEntryCutoff and afterEntryStart and withinVwapDistLong and validLongRisk and not reclaimBlockLong and vwapSpreadOk and bothVwapsFlat, "Skip: Flat VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Flat VWAP")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and beforeEntryCutoff and afterEntryStart and not withinVwapDistLong, "Skip: Far VWAP L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Far VWAP")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and beforeEntryCutoff and afterEntryStart and withinVwapDistLong and not validLongRisk, "Skip: Wide stop L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wide stop")
+plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and beforeEntryCutoff and afterEntryStart and withinVwapDistLong and validLongRisk and not reclaimBlockLong and vwapSpreadOk and not bothVwapsFlat and useCandleConfirm and not candleAlignLong, "Skip: Bad candle L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Bad candle")
 
 plotshape(shortSkipped and strategy.position_size != 0, "Skip: In pos S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="In position")
-plotshape(shortSkipped and strategy.position_size == 0 and dailyLossCapHit, "Skip: Daily cap S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Daily cap")
 plotshape(shortSkipped and canSkipBase and inLossCooldown, "Skip: Loss CD S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Cooldown")
 plotshape(shortSkipped and canSkipBase and not inLossCooldown and inSameDirCooldownShort, "Skip: Same dir CD S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Re-entry CD")
-plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and inGhostCooldownShort, "Skip: Ghost CD S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Ghost CD")
-plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not inGhostCooldownShort and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
-plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not inGhostCooldownShort and not beforeEntryCutoff, "Skip: Cutoff S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="After cutoff")
-plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not inGhostCooldownShort and not afterEntryStart, "Skip: Early S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Before 10am")
-plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not inGhostCooldownShort and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wait for OR")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and (not waitForOr or afterOrPeriod) and not freshShortBreak, "Skip: Chase S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Chase")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and reclaimBlockShort, "Skip: Reclaim S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Reclaim skip")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not reclaimBlockShort and bothVwapsFlat, "Skip: Flat VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Flat VWAP")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and priorOppositeLong, "Skip: Opp setup S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Opp setup")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and not withinVwapDistShort, "Skip: Far VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Far VWAP")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and not validShortRisk, "Skip: Wide stop S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wide stop")
-plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and not inGhostCooldownShort and beforeEntryCutoff and afterEntryStart and freshShortBreak and withinVwapDistShort and validShortRisk and not priorOppositeLong and not reclaimBlockShort and not bothVwapsFlat and useCandleConfirm and not candleAlignShort, "Skip: Bad candle S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Bad candle")
+plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
+plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not beforeEntryCutoff, "Skip: Cutoff S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="After cutoff")
+plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not afterEntryStart, "Skip: Early S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Before 10am")
+plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wait for OR")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and beforeEntryCutoff and afterEntryStart and withinVwapDistShort and validShortRisk and reclaimBlockShort, "Skip: Reclaim S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Reclaim skip")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and beforeEntryCutoff and afterEntryStart and withinVwapDistShort and validShortRisk and not reclaimBlockShort and not vwapSpreadOk, "Skip: Tight spread S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Tight spread")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and beforeEntryCutoff and afterEntryStart and withinVwapDistShort and validShortRisk and not reclaimBlockShort and vwapSpreadOk and bothVwapsFlat, "Skip: Flat VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Flat VWAP")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and beforeEntryCutoff and afterEntryStart and not withinVwapDistShort, "Skip: Far VWAP S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Far VWAP")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and beforeEntryCutoff and afterEntryStart and withinVwapDistShort and not validShortRisk, "Skip: Wide stop S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wide stop")
+plotshape(shortFilterSkip and canSkipBase and not inSameDirCooldownShort and beforeEntryCutoff and afterEntryStart and withinVwapDistShort and validShortRisk and not reclaimBlockShort and vwapSpreadOk and not bothVwapsFlat and useCandleConfirm and not candleAlignShort, "Skip: Bad candle S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Bad candle")
 
 // PnL label on trade exit
 var int prevClosedTrades = 0

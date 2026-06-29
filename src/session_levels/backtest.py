@@ -194,13 +194,6 @@ class _SessionState:
     last_loss_exit_bar: int | None = None
     last_long_exit_bar: int | None = None
     last_short_exit_bar: int | None = None
-    last_ghost_fail_long: int | None = None
-    last_ghost_fail_short: int | None = None
-    ghost_active: bool = False
-    ghost_dir: int = 0
-    ghost_entry_px: float = 0.0
-    ghost_stop_px: float = 0.0
-    ghost_risk: float = 0.0
     flattened_at_2pm: bool = False
     session_start_equity: float = 0.0
     session_start_bar: int = -1
@@ -219,8 +212,6 @@ class _SessionState:
     paper_entry_px: float = 0.0
     paper_stop_px: float = 0.0
     paper_dir: int = 0
-    long_vwap_setup_prev: bool = False
-    short_vwap_setup_prev: bool = False
 
 
 def _pnl(side: str, entry: float, exit_px: float, contracts: int, cfg: SessionLevelsConfig) -> float:
@@ -253,7 +244,6 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
     entry_cutoff_mins_ct = cfg.entry_end_hour_ct * 60 + cfg.entry_end_minute_ct
     entry_start_mins_et = cfg.entry_start_hour_et * 60 + cfg.entry_start_minute_et
     partial_qty = int(np.floor(cfg.trade_qty * cfg.partial_exit_pct / 100.0))
-    ghost_cd_bars = max(1, cfg.loss_cooldown // 2) if cfg.loss_cooldown > 0 else 0
 
     equity = cfg.initial_capital
     equity_points: list[tuple[pd.Timestamp, float]] = []
@@ -523,21 +513,16 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
         long_risk = c[i] - (l[i] - stop_buf)
         short_risk = (h[i] + stop_buf) - c[i]
 
-        was_above = (
-            not np.isnan(prev_sv) and not np.isnan(prev_pv)
-            and prev_c > prev_sv and prev_c > prev_pv
-        )
-        was_below = (
-            not np.isnan(prev_sv) and not np.isnan(prev_pv)
-            and prev_c < prev_sv and prev_c < prev_pv
-        )
-        fresh_long = not cfg.require_fresh_cross or not was_above
-        fresh_short = not cfg.require_fresh_cross or not was_below
-
         within_dist_long = cfg.max_vwap_dist_pts <= 0 or (not np.isnan(sv) and c[i] - sv <= cfg.max_vwap_dist_pts)
         within_dist_short = cfg.max_vwap_dist_pts <= 0 or (not np.isnan(sv) and sv - c[i] <= cfg.max_vwap_dist_pts)
         valid_long_risk = cfg.max_entry_risk_pts <= 0 or long_risk <= cfg.max_entry_risk_pts
         valid_short_risk = cfg.max_entry_risk_pts <= 0 or short_risk <= cfg.max_entry_risk_pts
+
+        spread_now = abs(sv - pv) if not np.isnan(sv) and not np.isnan(pv) else np.nan
+        spread_ok = (
+            cfg.min_vwap_spread_pts <= 0
+            or (not np.isnan(spread_now) and spread_now >= cfg.min_vwap_spread_pts)
+        )
 
         bars_since_sess = i - sess.session_start_bar if sess.session_start_bar >= 0 else 0
         can_flat = (
@@ -550,8 +535,7 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
         if can_flat:
             sess_slope = abs(sv - session_vwap[i - cfg.vwap_slope_lookback])
             pd_slope = abs(pv - prior_day_vwap[i - cfg.vwap_slope_lookback])
-            spread = abs(sv - pv)
-            compressed = cfg.max_vwap_spread_pts > 0 and spread <= cfg.max_vwap_spread_pts
+            compressed = cfg.max_vwap_spread_pts > 0 and not np.isnan(spread_now) and spread_now <= cfg.max_vwap_spread_pts
             sloping = (
                 cfg.max_vwap_slope_pts > 0
                 and sess_slope <= cfg.max_vwap_slope_pts
@@ -564,16 +548,13 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
         long_setup = can_enter and above_both and (cross_above_sess or cross_above_pd) and not strong_bear
         short_setup = can_enter and below_both and (cross_below_sess or cross_below_pd) and not strong_bull
 
-        prior_opp_short = cfg.skip_after_opposite_setup and sess.short_vwap_setup_prev
-        prior_opp_long = cfg.skip_after_opposite_setup and sess.long_vwap_setup_prev
-
         long_core = (
-            long_setup and fresh_long and within_dist_long and valid_long_risk
-            and not prior_opp_short and not both_flat and align_long(o, h, l, c, i, cfg)
+            long_setup and within_dist_long and valid_long_risk
+            and spread_ok and not both_flat and align_long(o, h, l, c, i, cfg)
         )
         short_core = (
-            short_setup and fresh_short and within_dist_short and valid_short_risk
-            and not prior_opp_long and not both_flat and align_short(o, h, l, c, i, cfg)
+            short_setup and within_dist_short and valid_short_risk
+            and spread_ok and not both_flat and align_short(o, h, l, c, i, cfg)
         )
 
         reclaim_block_long = cfg.use_skip_first_reclaim_after_win and sess.skip_next_long and long_core
@@ -585,9 +566,6 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
 
         long_signal = long_core and not reclaim_block_long
         short_signal = short_core and not reclaim_block_short
-
-        sess.long_vwap_setup_prev = long_setup
-        sess.short_vwap_setup_prev = short_setup
 
         # Cooldowns
         in_loss_cd = (
@@ -610,84 +588,16 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             and sess.last_short_exit_bar >= sess.session_start_bar
             and i - sess.last_short_exit_bar < cfg.same_dir_cooldown
         )
-        in_ghost_long = (
-            cfg.use_ghost_fail_cooldown
-            and ghost_cd_bars > 0
-            and sess.last_ghost_fail_long is not None
-            and sess.session_start_bar >= 0
-            and sess.last_ghost_fail_long >= sess.session_start_bar
-            and i - sess.last_ghost_fail_long < ghost_cd_bars
-        )
-        in_ghost_short = (
-            cfg.use_ghost_fail_cooldown
-            and ghost_cd_bars > 0
-            and sess.last_ghost_fail_short is not None
-            and sess.session_start_bar >= 0
-            and sess.last_ghost_fail_short >= sess.session_start_bar
-            and i - sess.last_ghost_fail_short < ghost_cd_bars
-        )
-
-        open_pnl = 0.0
-        if pos is not None:
-            direction = 1 if pos.side == "long" else -1
-            open_pnl = (c[i] - pos.entry_px) * direction * cfg.point_value * pos.qty
-
-        session_pnl = (equity - sess.session_start_equity) + open_pnl
-        daily_cap = (
-            cfg.use_daily_loss_cap
-            and cfg.max_daily_loss_usd > 0
-            and ir
-            and session_pnl <= -cfg.max_daily_loss_usd
-        )
 
         can_trade_base = (
             ir
             and pos is None
             and (not cfg.one_trade_per_day or not sess.traded_today)
-            and not daily_cap
             and not sess.trading_paused
         )
 
-        # Ghost tracking
-        long_blocked = long_setup and not long_signal and long_risk > 0
-        short_blocked = short_setup and not short_signal and short_risk > 0
-        will_long = can_trade_base and not in_loss_cd and not in_long_cd and not in_ghost_long and long_signal and long_risk > 0
-        will_short = can_trade_base and not in_loss_cd and not in_short_cd and not in_ghost_short and short_signal and short_risk > 0
-
-        if cfg.use_ghost_fail_cooldown and not sess.ghost_active and pos is None and can_trade_base and not in_loss_cd:
-            if not will_long and not will_short:
-                if short_blocked:
-                    sess.ghost_active = True
-                    sess.ghost_dir = -1
-                    sess.ghost_entry_px = c[i]
-                    sess.ghost_stop_px = h[i] + stop_buf
-                    sess.ghost_risk = short_risk
-                elif long_blocked:
-                    sess.ghost_active = True
-                    sess.ghost_dir = 1
-                    sess.ghost_entry_px = c[i]
-                    sess.ghost_stop_px = l[i] - stop_buf
-                    sess.ghost_risk = long_risk
-
-        if sess.ghost_active and sess.ghost_risk > 0:
-            if sess.ghost_dir == 1:
-                if l[i] <= sess.ghost_stop_px:
-                    sess.last_ghost_fail_long = i
-                    sess.ghost_active = False
-                elif h[i] >= sess.ghost_entry_px + sess.ghost_risk * cfg.partial_exit_rr:
-                    sess.ghost_active = False
-            elif sess.ghost_dir == -1:
-                if h[i] >= sess.ghost_stop_px:
-                    sess.last_ghost_fail_short = i
-                    sess.ghost_active = False
-                elif l[i] <= sess.ghost_entry_px - sess.ghost_risk * cfg.partial_exit_rr:
-                    sess.ghost_active = False
-
-        if rth_ended:
-            sess.ghost_active = False
-
         # Entries at close
-        if can_trade_base and not in_loss_cd and not in_long_cd and not in_ghost_long and long_signal and long_risk > 0:
+        if can_trade_base and not in_loss_cd and not in_long_cd and long_signal and long_risk > 0:
             entry_px = c[i]
             stop_px = l[i] - stop_buf
             pos = _Position(
@@ -703,9 +613,8 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             )
             sess.traded_today = True
             sess.position_start_equity = equity
-            sess.ghost_active = False
 
-        elif can_trade_base and not in_loss_cd and not in_short_cd and not in_ghost_short and short_signal and short_risk > 0:
+        elif can_trade_base and not in_loss_cd and not in_short_cd and short_signal and short_risk > 0:
             entry_px = c[i]
             stop_px = h[i] + stop_buf
             pos = _Position(
@@ -721,7 +630,6 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             )
             sess.traded_today = True
             sess.position_start_equity = equity
-            sess.ghost_active = False
 
         # Paper while paused
         if (
