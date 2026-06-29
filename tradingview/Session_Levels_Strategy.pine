@@ -21,7 +21,7 @@ orMinutes = input.int(15, "OR Duration (minutes)", minval=1, maxval=60, group=gr
 
 grpStrat = "VWAP Cross Strategy"
 useStrategy = input.bool(true, "Enable Strategy", group=grpStrat)
-tradeQty = input.int(5, "Contracts", minval=1, group=grpStrat)
+tradeQty = input.int(6, "Contracts", minval=1, group=grpStrat)
 oneTradePerDay = input.bool(false, "One Trade Per Day", group=grpStrat)
 stopBufferTicks = input.int(2, "Stop Buffer (ticks)", minval=0, group=grpStrat)
 trailLookback = input.int(3, "Trail Swing Lookback (bars)", minval=1, group=grpStrat,
@@ -42,7 +42,7 @@ sameDirCooldown = input.int(20, "Same Direction Cooldown (bars)", minval=0, grou
      tooltip="After any long/short closes, wait N bars before another entry in that same direction.")
 useSkipFirstReclaimAfterWin = input.bool(true, "Skip First Reclaim After Win", group=grpStrat,
      tooltip="After a winning long, if price closes back below session VWAP then crosses above again, skip the first new long signal (mirror for shorts above VWAP).")
-useGhostFailCooldown = input.bool(true, "Cooldown After Failed Skipped Setup", group=grpStrat,
+useGhostFailCooldown = input.bool(false, "Cooldown After Failed Skipped Setup", group=grpStrat,
      tooltip="Paper-track filter-blocked VWAP setups. If the hypothetical stop is hit, wait half the loss cooldown before another entry in the same direction.")
 oppBodyPct = input.float(0.60, "Long Opposite Candle Body %", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
      tooltip="Skip long if prior bar is strong bearish (body >= this % of range). Set to 0 to disable.")

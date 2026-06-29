@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class SessionLevelsConfig:
     """Defaults mirror tradingview/Session_Levels_Strategy.pine inputs."""
 
-    trade_qty: int = 5
+    trade_qty: int = 6
     one_trade_per_day: bool = False
     stop_buffer_ticks: int = 2
     trail_lookback: int = 3
@@ -24,7 +24,7 @@ class SessionLevelsConfig:
     loss_cooldown: int = 10
     same_dir_cooldown: int = 20
     use_skip_first_reclaim_after_win: bool = True
-    use_ghost_fail_cooldown: bool = True
+    use_ghost_fail_cooldown: bool = False
     opp_body_pct: float = 0.60
     opp_body_pct_short: float = 0.70
     skip_after_opposite_setup: bool = True
