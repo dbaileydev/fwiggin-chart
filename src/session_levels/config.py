@@ -9,7 +9,8 @@ class SessionLevelsConfig:
 
     trade_qty: int = 6
     one_trade_per_day: bool = False
-    stop_buffer_ticks: int = 2
+    stop_buffer_ticks: int = 2  # live entries, stops, trail
+    pause_stop_buffer_ticks: int = 15  # paper trades while paused
     trail_lookback: int = 3
     trail_activate_rr: float = 2.0
     rr_ratio: float = 3.0
@@ -19,17 +20,22 @@ class SessionLevelsConfig:
     or_minutes: int = 15
     entry_start_hour_et: int = 10
     entry_start_minute_et: int = 0
-    entry_end_hour_ct: int = 14
-    entry_end_minute_ct: int = 0
+    entry_end_hour_ct: int = 13
+    entry_end_minute_ct: int = 30
     loss_cooldown: int = 10
     same_dir_cooldown: int = 20
     use_skip_first_reclaim_after_win: bool = True
     opp_body_pct: float = 0.60
     opp_body_pct_short: float = 0.70
     flatten_at_2pm: bool = True
-    use_loss_streak_pause: bool = False
-    loss_streak_days: int = 2
-    recovery_win_days: int = 2
+    flatten_end_hour_ct: int = 14
+    flatten_end_minute_ct: int = 0
+    use_loss_streak_defense: bool = True
+    loss_streak_mode: str = "pause"  # "pause" | "reduce_size"
+    streak_loss_trades: int = 3
+    streak_win_trades: int = 1
+    defense_contracts: int = 3
+    pause_sim_win_rr: float = 2.0
     max_vwap_dist_pts: float = 50.0
     min_vwap_spread_pts: float = 15.0
     skip_flat_vwaps: bool = True

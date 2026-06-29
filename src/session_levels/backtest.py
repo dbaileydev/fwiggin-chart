@@ -202,10 +202,9 @@ class _SessionState:
     skip_next_long: bool = False
     skip_next_short: bool = False
     position_start_equity: float | None = None
-    loss_streak_paused: bool = False
-    trading_paused: bool = False
-    consecutive_loss_days: int = 0
-    consecutive_recovery_wins: int = 0
+    loss_streak_defense_active: bool = False
+    consecutive_loss_trades: int = 0
+    consecutive_win_trades_defense: int = 0
     paper_traded_today: bool = False
     paper_active: bool = False
     paper_stopped: bool = False
@@ -241,7 +240,9 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
     or_after_period = data["or_after_period"]
 
     stop_buf = cfg.stop_buffer_ticks * cfg.tick_size
+    paper_stop_buf = cfg.pause_stop_buffer_ticks * cfg.tick_size
     entry_cutoff_mins_ct = cfg.entry_end_hour_ct * 60 + cfg.entry_end_minute_ct
+    flatten_cutoff_mins_ct = cfg.flatten_end_hour_ct * 60 + cfg.flatten_end_minute_ct
     entry_start_mins_et = cfg.entry_start_hour_et * 60 + cfg.entry_start_minute_et
     partial_qty = int(np.floor(cfg.trade_qty * cfg.partial_exit_pct / 100.0))
 
@@ -267,6 +268,19 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
         equity += net
         if net < 0 and sess.session_start_bar >= 0 and bar_i >= sess.session_start_bar:
             sess.last_loss_exit_bar = bar_i
+            if cfg.use_loss_streak_defense:
+                sess.consecutive_loss_trades += 1
+                if sess.loss_streak_defense_active and cfg.loss_streak_mode == "reduce_size":
+                    sess.consecutive_win_trades_defense = 0
+                if sess.consecutive_loss_trades >= cfg.streak_loss_trades:
+                    sess.loss_streak_defense_active = True
+        elif net > 0 and cfg.use_loss_streak_defense:
+            sess.consecutive_loss_trades = 0
+            if sess.loss_streak_defense_active and cfg.loss_streak_mode == "reduce_size":
+                sess.consecutive_win_trades_defense += 1
+                if sess.consecutive_win_trades_defense >= cfg.streak_win_trades:
+                    sess.loss_streak_defense_active = False
+                    sess.consecutive_win_trades_defense = 0
         trades.append(
             Trade(
                 side=side,
@@ -289,13 +303,12 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
 
         if rth_started:
             sess = _SessionState(
-                loss_streak_paused=sess.loss_streak_paused,
-                consecutive_loss_days=sess.consecutive_loss_days,
-                consecutive_recovery_wins=sess.consecutive_recovery_wins,
+                loss_streak_defense_active=sess.loss_streak_defense_active,
+                consecutive_loss_trades=sess.consecutive_loss_trades,
+                consecutive_win_trades_defense=sess.consecutive_win_trades_defense,
             )
             sess.session_start_equity = equity
             sess.session_start_bar = i
-            sess.trading_paused = cfg.use_loss_streak_pause and sess.loss_streak_paused
 
         sv = session_vwap[i]
         pv = prior_day_vwap[i]
@@ -328,7 +341,7 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             exited = False
 
             if pos is not None and cfg.flatten_at_2pm and ir and not sess.flattened_at_2pm:
-                if _mins_ct(ts) >= entry_cutoff_mins_ct:
+                if _mins_ct(ts) >= flatten_cutoff_mins_ct:
                     close_leg(
                         side, pos.entry_px, pos.entry_time, c[i], ts, pos.qty,
                         ExitReason.FLATTEN_2PM, i,
@@ -440,38 +453,6 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
                 sess.skip_next_short = True
                 sess.short_win_watch = False
 
-        # Loss streak at session end
-        if rth_ended and prev_in_rth and cfg.use_loss_streak_pause and i > 0:
-            ended_pnl = equity - sess.session_start_equity
-            if sess.trading_paused:
-                if sess.paper_traded_today:
-                    paper_win = (
-                        not sess.paper_stopped
-                        and (
-                            (sess.paper_dir == 1 and c[i - 1] - sess.paper_entry_px > 0)
-                            or (sess.paper_dir == -1 and sess.paper_entry_px - c[i - 1] > 0)
-                        )
-                    )
-                    sess.consecutive_recovery_wins = (
-                        sess.consecutive_recovery_wins + 1 if paper_win else 0
-                    )
-                    if sess.consecutive_recovery_wins >= cfg.recovery_win_days:
-                        sess.loss_streak_paused = False
-                        sess.consecutive_recovery_wins = 0
-                        sess.consecutive_loss_days = 0
-                else:
-                    sess.consecutive_recovery_wins = 0
-            elif sess.traded_today:
-                if ended_pnl < 0:
-                    sess.consecutive_loss_days += 1
-                else:
-                    sess.consecutive_loss_days = 0
-                if sess.consecutive_loss_days >= cfg.loss_streak_days:
-                    sess.loss_streak_paused = True
-                    sess.consecutive_recovery_wins = 0
-            else:
-                sess.consecutive_loss_days = 0
-
         # ── Entry signals (process_orders_on_close → entry at bar close) ──
         before_cutoff = _mins_ct(ts) < entry_cutoff_mins_ct
         after_start = _mins_et(ts) >= entry_start_mins_et
@@ -510,8 +491,15 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             and prior_body_pct >= cfg.opp_body_pct_short
         )
 
-        long_risk = c[i] - (l[i] - stop_buf)
-        short_risk = (h[i] + stop_buf) - c[i]
+        loss_streak_pause_active = (
+            cfg.use_loss_streak_defense
+            and sess.loss_streak_defense_active
+            and cfg.loss_streak_mode == "pause"
+        )
+
+        risk_stop_buf = paper_stop_buf if loss_streak_pause_active else stop_buf
+        long_risk = c[i] - (l[i] - risk_stop_buf)
+        short_risk = (h[i] + risk_stop_buf) - c[i]
 
         within_dist_long = cfg.max_vwap_dist_pts <= 0 or (not np.isnan(sv) and c[i] - sv <= cfg.max_vwap_dist_pts)
         within_dist_short = cfg.max_vwap_dist_pts <= 0 or (not np.isnan(sv) and sv - c[i] <= cfg.max_vwap_dist_pts)
@@ -589,11 +577,19 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             and i - sess.last_short_exit_bar < cfg.same_dir_cooldown
         )
 
+        active_qty = (
+            min(cfg.defense_contracts, cfg.trade_qty)
+            if cfg.use_loss_streak_defense
+            and sess.loss_streak_defense_active
+            and cfg.loss_streak_mode == "reduce_size"
+            else cfg.trade_qty
+        )
+
         can_trade_base = (
             ir
             and pos is None
             and (not cfg.one_trade_per_day or not sess.traded_today)
-            and not sess.trading_paused
+            and not loss_streak_pause_active
         )
 
         # Entries at close
@@ -602,7 +598,7 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             stop_px = l[i] - stop_buf
             pos = _Position(
                 side="long",
-                qty=cfg.trade_qty,
+                qty=active_qty,
                 entry_px=entry_px,
                 entry_time=ts,
                 entry_bar=i,
@@ -619,7 +615,7 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             stop_px = h[i] + stop_buf
             pos = _Position(
                 side="short",
-                qty=cfg.trade_qty,
+                qty=active_qty,
                 entry_px=entry_px,
                 entry_time=ts,
                 entry_bar=i,
@@ -631,33 +627,48 @@ def run_backtest(df: pd.DataFrame, cfg: SessionLevelsConfig | None = None) -> Ba
             sess.traded_today = True
             sess.position_start_equity = equity
 
-        # Paper while paused
+        # Paper while paused (pause mode only)
         if (
-            sess.trading_paused and ir and before_cutoff and not sess.paper_traded_today
+            loss_streak_pause_active and ir and before_cutoff and not sess.paper_traded_today
             and pos is None
         ):
             if long_signal and long_risk > 0:
                 sess.paper_traded_today = True
                 sess.paper_active = True
                 sess.paper_entry_px = c[i]
-                sess.paper_stop_px = l[i] - stop_buf
+                sess.paper_stop_px = l[i] - paper_stop_buf
                 sess.paper_dir = 1
                 sess.paper_stopped = False
             elif short_signal and short_risk > 0:
                 sess.paper_traded_today = True
                 sess.paper_active = True
                 sess.paper_entry_px = c[i]
-                sess.paper_stop_px = h[i] + stop_buf
+                sess.paper_stop_px = h[i] + paper_stop_buf
                 sess.paper_dir = -1
                 sess.paper_stopped = False
 
         if sess.paper_active and not sess.paper_stopped:
-            if sess.paper_dir == 1 and l[i] <= sess.paper_stop_px:
-                sess.paper_stopped = True
-                sess.paper_active = False
-            elif sess.paper_dir == -1 and h[i] >= sess.paper_stop_px:
-                sess.paper_stopped = True
-                sess.paper_active = False
+            paper_risk = abs(sess.paper_entry_px - sess.paper_stop_px)
+            if sess.paper_dir == 1:
+                paper_partial_px = sess.paper_entry_px + paper_risk * cfg.pause_sim_win_rr
+                if l[i] <= sess.paper_stop_px:
+                    sess.paper_stopped = True
+                    sess.paper_active = False
+                elif h[i] >= paper_partial_px and l[i] > sess.paper_stop_px:
+                    sess.loss_streak_defense_active = False
+                    sess.consecutive_loss_trades = 0
+                    sess.consecutive_win_trades_defense = 0
+                    sess.paper_active = False
+            else:
+                paper_partial_px = sess.paper_entry_px - paper_risk * cfg.pause_sim_win_rr
+                if h[i] >= sess.paper_stop_px:
+                    sess.paper_stopped = True
+                    sess.paper_active = False
+                elif l[i] <= paper_partial_px and h[i] < sess.paper_stop_px:
+                    sess.loss_streak_defense_active = False
+                    sess.consecutive_loss_trades = 0
+                    sess.consecutive_win_trades_defense = 0
+                    sess.paper_active = False
 
         equity_points.append((ts, equity))
         prev_in_rth = ir

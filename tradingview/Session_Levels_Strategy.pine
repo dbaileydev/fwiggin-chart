@@ -23,7 +23,8 @@ grpStrat = "VWAP Cross Strategy"
 useStrategy = input.bool(true, "Enable Strategy", group=grpStrat)
 tradeQty = input.int(6, "Contracts", minval=1, group=grpStrat)
 oneTradePerDay = input.bool(false, "One Trade Per Day", group=grpStrat)
-stopBufferTicks = input.int(2, "Stop Buffer (ticks)", minval=0, group=grpStrat)
+stopBufferTicks = input.int(2, "Live Stop Buffer (ticks)", minval=0, group=grpStrat,
+     tooltip="Stop buffer for live entries, initial stops, and trail swing offset.")
 trailLookback = input.int(3, "Trail Swing Lookback (bars)", minval=1, group=grpStrat,
      tooltip="After trail R:R is hit, trail stop behind swing high/low of last N bars.")
 trailActivateRr = input.float(2, "Trail Activate R:R", minval=0.5, step=0.25, group=grpStrat,
@@ -47,18 +48,25 @@ oppBodyPct = input.float(0.60, "Long Opposite Candle Body %", minval=0.0, maxval
 oppBodyPctShort = input.float(0.70, "Short Opposite Candle Body %", minval=0.0, maxval=1.0, step=0.05, group=grpStrat,
      tooltip="Skip short if prior bar is strong bullish (body >= this % of range). Set to 0 to disable.")
 flattenAt2Pm = input.bool(true, "Flatten All at 2PM CT", group=grpStrat,
-     tooltip="At 2PM CT, close all open positions (winners, losers, and trailing).")
-grpDefense = "Defensive Mode"
-useDefensiveMode = input.bool(false, "Enable Defensive Mode", group=grpDefense,
-     tooltip="After consecutive losing days, use defensive partial/trail R:R until consecutive winning days.")
-defensiveLossDays = input.int(2, "Loss Days to Activate", minval=1, group=grpDefense,
-     tooltip="Consecutive losing traded days to enter defensive mode.")
-defensiveWinDays = input.int(2, "Win Days to Deactivate", minval=1, group=grpDefense,
-     tooltip="Consecutive winning traded days to return to normal mode.")
-defensivePartialRr = input.float(1, "Defensive Partial R:R", minval=0.25, step=0.25, group=grpDefense,
-     tooltip="Take partial profit earlier when defensive. Normal uses the main Partial Exit R:R.")
-defensiveTrailRr = input.float(1, "Defensive Trail R:R", minval=0.5, step=0.25, group=grpDefense,
-     tooltip="Start trailing sooner when defensive. Normal uses the main Trail Activate R:R.")
+     tooltip="At the flatten time (CT), close all open positions (winners, losers, and trailing).")
+flattenEndHourCt = input.int(14, "Flatten Hour (CT)", minval=0, maxval=23, group=grpStrat)
+flattenEndMinuteCt = input.int(0, "Flatten Minute (CT)", minval=0, maxval=59, group=grpStrat,
+     tooltip="Close all positions at or after this Central Time. Default: 2:00 PM CT.")
+grpDefense = "Loss Streak Defense"
+useLossStreakDefense = input.bool(true, "Enable Loss Streak Defense", group=grpDefense,
+     tooltip="After consecutive losing trades, pause entries or trade reduced size until defense clears.")
+lossStreakMode = input.string("Pause", "Loss Streak Action", options=["Pause", "Reduce Size"], group=grpDefense,
+     tooltip="Pause: no live entries until a paper trade wins. Reduce Size: keep trading at Defense Contracts until a live win.")
+streakLossTrades = input.int(3, "Loss Trades to Activate", minval=1, group=grpDefense,
+     tooltip="Consecutive losing closed trades before defense mode activates.")
+streakWinTrades = input.int(1, "Wins to Resume Full Size", minval=1, group=grpDefense,
+     tooltip="Reduce Size: consecutive winning closed trades to return to full Contracts.")
+defenseContracts = input.int(3, "Defense Contracts", minval=1, group=grpDefense,
+     tooltip="Live contract size while in Reduce Size defense mode.")
+pauseSimWinRr = input.float(2, "Paper Win R:R", minval=0.25, step=0.25, group=grpDefense,
+     tooltip="Pause mode only: paper trade must reach this R:R before stop to resume full size.")
+pauseStopBufferTicks = input.int(15, "Paper Stop Buffer (ticks)", minval=0, group=grpDefense,
+     tooltip="Pause mode only: stop buffer for paper trades. Does not affect Live Stop Buffer (ticks).")
 
 maxVwapDistPts = input.float(50.0, "Max Session VWAP Distance (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Skip if entry close is farther than this from session VWAP. Set to 0 to disable.")
@@ -74,9 +82,9 @@ maxVwapSlopePts = input.float(15.0, "Max VWAP Slope (pts)", minval=0, step=5.0, 
      tooltip="Each VWAP must rise/fall more than this over the lookback. Both below = flat. Set to 0 to disable.")
 maxEntryRiskPts = input.float(80.0, "Max Entry Bar Risk (pts)", minval=0, step=5.0, group=grpStrat,
      tooltip="Skip if signal-bar stop risk exceeds this. Set to 0 to disable.")
-entryEndHourCt = input.int(14, "No Entries After Hour (CT)", minval=0, maxval=23, group=grpStrat)
-entryEndMinuteCt = input.int(0, "No Entries After Minute (CT)", minval=0, maxval=59, group=grpStrat,
-     tooltip="No new entries at or after this Central Time (America/Chicago). Default: 2:00 PM CT.")
+entryEndHourCt = input.int(13, "No Entries After Hour (CT)", minval=0, maxval=23, group=grpStrat)
+entryEndMinuteCt = input.int(30, "No Entries After Minute (CT)", minval=0, maxval=59, group=grpStrat,
+     tooltip="No new entries at or after this Central Time (America/Chicago). Default: 1:30 PM CT.")
 showSkipLabels = input.bool(true, "Show Skip Reasons", group=grpStrat,
      tooltip="Orange X on skipped signals. Click that bar → Data Window (right panel) shows the skip reason.")
 
@@ -133,6 +141,7 @@ rthStarted = inRth and not inRth[1] and isTradingDay
 rthEnded = inRth[1] and not inRth
 
 entryCutoffMinsCt = entryEndHourCt * 60 + entryEndMinuteCt
+flattenCutoffMinsCt = flattenEndHourCt * 60 + flattenEndMinuteCt
 barMinsCt = hour(time, tzCt) * 60 + minute(time, tzCt)
 beforeEntryCutoff = barMinsCt < entryCutoffMinsCt
 
@@ -408,9 +417,17 @@ var float tradePartialPx = na
 var bool partialTaken = false
 
 var float positionStartNetProfit = na
-var bool inDefensive = false
-var int defLossDays = 0
-var int defWinDays = 0
+var int consecLossTrades = 0
+var int consecWinTradesDefense = 0
+var bool lossStreakDefenseActive = false
+var int lastClosedForStreak = 0
+var bool ghostActive = false
+var float ghostEntryPx = na
+var float ghostStopPx = na
+var float ghostPartialPx = na
+var float ghostRisk = na
+var int ghostDir = 0
+var int ghostStartBar = na
 var bool longWinWatchReclaim = false
 var bool shortWinWatchReclaim = false
 var bool skipNextLongReclaim = false
@@ -441,29 +458,39 @@ if rthStarted
     shortWinWatchReclaim := false
     skipNextLongReclaim := false
     skipNextShortReclaim := false
+    if ghostActive
+        ghostActive := false
+        ghostEntryPx := na
+        ghostStopPx := na
+        ghostPartialPx := na
+        ghostRisk := na
+        ghostDir := 0
+        ghostStartBar := na
 
-// Defensive mode: track consecutive win/loss days at session end
-if rthEnded and isTradingDay[1] and useDefensiveMode and tradedToday
-    endedPnl = strategy.netprofit - sessionStartNetProfit
-    if endedPnl < 0
-        defLossDays += 1
-        defWinDays := 0
-        if defLossDays >= defensiveLossDays
-            inDefensive := true
-    else if endedPnl > 0
-        defWinDays += 1
-        defLossDays := 0
-        if inDefensive and defWinDays >= defensiveWinDays
-            inDefensive := false
-    else
-        defLossDays := 0
-        defWinDays := 0
+// Loss streak defense: consecutive losing / winning closed trades
+if strategy.closedtrades > lastClosedForStreak and useLossStreakDefense
+    exitPnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if exitPnl < 0
+        consecLossTrades += 1
+        if lossStreakDefenseActive and lossStreakMode == "Reduce Size"
+            consecWinTradesDefense := 0
+        if consecLossTrades >= streakLossTrades
+            lossStreakDefenseActive := true
+    else if exitPnl > 0
+        consecLossTrades := 0
+        if lossStreakDefenseActive and lossStreakMode == "Reduce Size"
+            consecWinTradesDefense += 1
+            if consecWinTradesDefense >= streakWinTrades
+                lossStreakDefenseActive := false
+                consecWinTradesDefense := 0
+    lastClosedForStreak := strategy.closedtrades
 
-// Defensive mode: tighter partial/trail R:R only (size and trade count unchanged)
-defensiveActive = useDefensiveMode and inDefensive
-activeQty = tradeQty
-activePartialRr = defensiveActive ? defensivePartialRr : partialExitRr
-activeTrailRr = defensiveActive ? defensiveTrailRr : trailActivateRr
+lossStreakPauseActive = useLossStreakDefense and lossStreakDefenseActive and lossStreakMode == "Pause"
+lossStreakReduceActive = useLossStreakDefense and lossStreakDefenseActive and lossStreakMode == "Reduce Size"
+defenseQtyEffective = math.min(defenseContracts, tradeQty)
+activeQty = lossStreakReduceActive ? defenseQtyEffective : tradeQty
+activePartialRr = partialExitRr
+activeTrailRr = trailActivateRr
 
 // Loss-only cooldown (current session)
 if strategy.closedtrades > 0 and not na(sessionStartBar)
@@ -499,7 +526,8 @@ if useSkipFirstReclaimAfterWin and strategy.position_size == 0
 inSameDirCooldownLong = sameDirCooldown > 0 and not na(lastLongExitBar) and not na(sessionStartBar) and lastLongExitBar >= sessionStartBar and bar_index - lastLongExitBar < sameDirCooldown
 inSameDirCooldownShort = sameDirCooldown > 0 and not na(lastShortExitBar) and not na(sessionStartBar) and lastShortExitBar >= sessionStartBar and bar_index - lastShortExitBar < sameDirCooldown
 
-stopBuf = stopBufferTicks * syminfo.mintick
+liveStopBuf = stopBufferTicks * syminfo.mintick
+paperStopBuf = pauseStopBufferTicks * syminfo.mintick
 
 aboveBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close > sessionVwap and close > priorDayVwap
 belowBothVwap = not na(sessionVwap) and not na(priorDayVwap) and close < sessionVwap and close < priorDayVwap
@@ -550,14 +578,18 @@ candleOpposeShort = isHammer or bullEngulf or isDojiBar or not isBearBar
 candleAlignLong = not useCandleConfirm or (candleConfirmLong and not candleOpposeLong)
 candleAlignShort = not useCandleConfirm or (candleConfirmShort and not candleOpposeShort)
 
-longRiskEst = close - (low - stopBuf)
-shortRiskEst = (high + stopBuf) - close
+longRiskEst = close - (low - liveStopBuf)
+shortRiskEst = (high + liveStopBuf) - close
+paperLongRiskEst = close - (low - paperStopBuf)
+paperShortRiskEst = (high + paperStopBuf) - close
 
 withinVwapDistLong = maxVwapDistPts <= 0 or (not na(sessionVwap) and close - sessionVwap <= maxVwapDistPts)
 withinVwapDistShort = maxVwapDistPts <= 0 or (not na(sessionVwap) and sessionVwap - close <= maxVwapDistPts)
 
 validLongRisk = maxEntryRiskPts <= 0 or longRiskEst <= maxEntryRiskPts
 validShortRisk = maxEntryRiskPts <= 0 or shortRiskEst <= maxEntryRiskPts
+paperValidLongRisk = maxEntryRiskPts <= 0 or paperLongRiskEst <= maxEntryRiskPts
+paperValidShortRisk = maxEntryRiskPts <= 0 or paperShortRiskEst <= maxEntryRiskPts
 
 barsSinceSession = not na(sessionStartBar) ? bar_index - sessionStartBar : 0
 vwapSpreadNow = not na(sessionVwap) and not na(priorDayVwap) ? math.abs(sessionVwap - priorDayVwap) : na
@@ -574,6 +606,8 @@ shortVwapSetup = canEnter and belowBothVwap and (crossBelowSessVwap or crossBelo
 
 longSignalCore = longVwapSetup and withinVwapDistLong and validLongRisk and vwapSpreadOk and not bothVwapsFlat and candleAlignLong
 shortSignalCore = shortVwapSetup and withinVwapDistShort and validShortRisk and vwapSpreadOk and not bothVwapsFlat and candleAlignShort
+longPaperSignalCore = longVwapSetup and withinVwapDistLong and paperValidLongRisk and vwapSpreadOk and not bothVwapsFlat and candleAlignLong
+shortPaperSignalCore = shortVwapSetup and withinVwapDistShort and paperValidShortRisk and vwapSpreadOk and not bothVwapsFlat and candleAlignShort
 
 reclaimBlockLong = useSkipFirstReclaimAfterWin and skipNextLongReclaim and longSignalCore
 reclaimBlockShort = useSkipFirstReclaimAfterWin and skipNextShortReclaim and shortSignalCore
@@ -585,8 +619,10 @@ if reclaimBlockShort
 
 longSignal = longSignalCore and not reclaimBlockLong
 shortSignal = shortSignalCore and not reclaimBlockShort
+longPaperSignal = longPaperSignalCore and not reclaimBlockLong
+shortPaperSignal = shortPaperSignalCore and not reclaimBlockShort
 
-canTradeBase = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday)
+canTradeBase = useStrategy and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday) and not lossStreakPauseActive
 
 canTradeLong = canTradeBase and not inLossCooldown and not inSameDirCooldownLong
 canTradeShort = canTradeBase and not inLossCooldown and not inSameDirCooldownShort
@@ -612,6 +648,8 @@ tradeBlockReason() =>
         "In position"
     else if oneTradePerDay and tradedToday
         "1 trade/day"
+    else if lossStreakPauseActive
+        "Paused"
     else if inLossCooldown
         "Loss cooldown"
     else if inSameDirCooldownLong or inSameDirCooldownShort
@@ -621,7 +659,7 @@ tradeBlockReason() =>
 
 if barstate.isconfirmed and canTradeLong and longSignal
     entryPx = close
-    stopPx = low - stopBuf
+    stopPx = low - liveStopBuf
     risk = longRiskEst
     if risk > 0
         strategy.entry("Long", strategy.long, qty=activeQty)
@@ -641,7 +679,7 @@ if barstate.isconfirmed and canTradeLong and longSignal
 
 if barstate.isconfirmed and canTradeShort and shortSignal
     entryPx = close
-    stopPx = high + stopBuf
+    stopPx = high + liveStopBuf
     risk = shortRiskEst
     if risk > 0
         strategy.entry("Short", strategy.short, qty=activeQty)
@@ -659,6 +697,93 @@ if barstate.isconfirmed and canTradeShort and shortSignal
         trailing := false
         trailStop := na
 
+// ── Paper trade while paused (simulated win re-enables live trading) ─────────
+paperCanBase = useStrategy and lossStreakPauseActive and inRth and isTradingDay and beforeEntryCutoff and strategy.position_size == 0 and not ghostActive
+
+if barstate.isconfirmed and paperCanBase and longPaperSignal
+    entryPx = close
+    risk = paperLongRiskEst
+    if risk > 0
+        ghostActive := true
+        ghostEntryPx := entryPx
+        ghostStopPx := low - paperStopBuf
+        ghostRisk := risk
+        ghostPartialPx := entryPx + risk * pauseSimWinRr
+        ghostDir := 1
+        ghostStartBar := bar_index
+
+if barstate.isconfirmed and paperCanBase and shortPaperSignal
+    entryPx = close
+    risk = paperShortRiskEst
+    if risk > 0
+        ghostActive := true
+        ghostEntryPx := entryPx
+        ghostStopPx := high + paperStopBuf
+        ghostRisk := risk
+        ghostPartialPx := entryPx - risk * pauseSimWinRr
+        ghostDir := -1
+        ghostStartBar := bar_index
+
+ghostArmed = ghostActive and not na(ghostStartBar) and bar_index > ghostStartBar
+
+if ghostArmed and flattenAt2Pm and inRth and isTradingDay and barMinsCt >= flattenCutoffMinsCt
+    ghostActive := false
+    ghostEntryPx := na
+    ghostStopPx := na
+    ghostPartialPx := na
+    ghostRisk := na
+    ghostDir := 0
+    ghostStartBar := na
+
+if ghostArmed and ghostDir == 1
+    if low <= ghostStopPx
+        ghostActive := false
+        ghostEntryPx := na
+        ghostStopPx := na
+        ghostPartialPx := na
+        ghostRisk := na
+        ghostDir := 0
+        ghostStartBar := na
+    else if high >= ghostPartialPx and low > ghostStopPx
+        lossStreakDefenseActive := false
+        consecLossTrades := 0
+        consecWinTradesDefense := 0
+        ghostActive := false
+        ghostEntryPx := na
+        ghostStopPx := na
+        ghostPartialPx := na
+        ghostRisk := na
+        ghostDir := 0
+        ghostStartBar := na
+        if showSkipLabels
+            label.new(bar_index, high, "Paper Win", style=label.style_label_down, color=color.new(color.lime, 70), textcolor=color.lime, size=size.small)
+
+if ghostArmed and ghostDir == -1
+    if high >= ghostStopPx
+        ghostActive := false
+        ghostEntryPx := na
+        ghostStopPx := na
+        ghostPartialPx := na
+        ghostRisk := na
+        ghostDir := 0
+        ghostStartBar := na
+    else if low <= ghostPartialPx and high < ghostStopPx
+        lossStreakDefenseActive := false
+        consecLossTrades := 0
+        consecWinTradesDefense := 0
+        ghostActive := false
+        ghostEntryPx := na
+        ghostStopPx := na
+        ghostPartialPx := na
+        ghostRisk := na
+        ghostDir := 0
+        ghostStartBar := na
+        if showSkipLabels
+            label.new(bar_index, low, "Paper Win", style=label.style_label_up, color=color.new(color.lime, 70), textcolor=color.lime, size=size.small)
+
+ghostStartedLong = ghostActive and ghostDir == 1 and ghostStartBar == bar_index
+ghostStartedShort = ghostActive and ghostDir == -1 and ghostStartBar == bar_index
+
 enteredLongThisBar = not na(longEntryBar) and longEntryBar == bar_index
 enteredShortThisBar = not na(shortEntryBar) and shortEntryBar == bar_index
 longSkipped = useStrategy and showSkipLabels and longVwapSetup and not enteredLongThisBar
@@ -671,7 +796,7 @@ partialQty = int(math.floor(activeQty * partialExitPct / 100.0))
 canPartial = not partialTaken and partialQty >= 1 and partialQty < activeQty
 
 // Flatten all open trades at 2PM CT
-if flattenAt2Pm and inRth and isTradingDay and not flattenedAt2Pm and barMinsCt >= entryCutoffMinsCt
+if flattenAt2Pm and inRth and isTradingDay and not flattenedAt2Pm and barMinsCt >= flattenCutoffMinsCt
     if strategy.position_size > 0
         strategy.close("Long", comment="2PM Flatten")
     if strategy.position_size < 0
@@ -684,7 +809,7 @@ if exitsArmed and trailing and strategy.position_size > 0 and not na(tradeEntryP
     swingLow = low
     for j = 1 to trailLookback - 1
         swingLow := math.min(swingLow, low[j])
-    newTrail = swingLow - stopBuf
+    newTrail = swingLow - liveStopBuf
     if na(trailStop) or newTrail > trailStop
         trailStop := newTrail
 
@@ -692,7 +817,7 @@ if exitsArmed and trailing and strategy.position_size < 0 and not na(tradeEntryP
     swingHigh = high
     for j = 1 to trailLookback - 1
         swingHigh := math.max(swingHigh, high[j])
-    newTrail = swingHigh + stopBuf
+    newTrail = swingHigh + liveStopBuf
     if na(trailStop) or newTrail < trailStop
         trailStop := newTrail
 
@@ -725,7 +850,7 @@ if exitsArmed and not trailing and strategy.position_size > 0 and not na(tradeEn
         swingLow = low
         for j = 1 to trailLookback - 1
             swingLow := math.min(swingLow, low[j])
-        trailStop := swingLow - stopBuf
+        trailStop := swingLow - liveStopBuf
 if exitsArmed and not trailing and strategy.position_size < 0 and not na(tradeEntryPx) and not na(tradeRisk)
     if low <= tradeEntryPx - tradeRisk * activeTrailRr
         trailing := true
@@ -733,7 +858,7 @@ if exitsArmed and not trailing and strategy.position_size < 0 and not na(tradeEn
         swingHigh = high
         for j = 1 to trailLookback - 1
             swingHigh := math.max(swingHigh, high[j])
-        trailStop := swingHigh + stopBuf
+        trailStop := swingHigh + liveStopBuf
 
 // 4) Hard TP at 3R while still pre-trail (optional cap before runner trails)
 if exitsArmed and not trailing
@@ -753,8 +878,11 @@ if strategy.position_size == 0 and not na(tradeEntryBar) and bar_index > tradeEn
 
 plotshape(enteredLongThisBar, "Long Signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small, display=display.all - display.status_line)
 plotshape(enteredShortThisBar, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small, display=display.all - display.status_line)
-// ── Loss streak pause background (red tint when paused) ──────────────────────
-bgcolor(defensiveActive and inRth ? color.new(color.orange, 93) : na, title="Defensive Mode")
+plotshape(ghostStartedLong, "Paper Long", shape.circle, location.belowbar, color.new(color.aqua, 0), size=size.tiny, display=display.all - display.status_line, text="Paper")
+plotshape(ghostStartedShort, "Paper Short", shape.circle, location.abovebar, color.new(color.aqua, 0), size=size.tiny, display=display.all - display.status_line, text="Paper")
+bgcolor(lossStreakPauseActive and inRth ? color.new(color.red, 93) : na, title="Paused")
+bgcolor(lossStreakReduceActive and inRth ? color.new(color.orange, 93) : na, title="Reduced Size")
+bgcolor(lossStreakPauseActive and ghostActive and inRth ? color.new(color.aqua, 95) : na, title="Paper Trade")
 
 // ── Skip reason text on chart ────────────────────────────────────────────────
 canSkipBase = strategy.position_size == 0 and not inLossCooldown
@@ -762,7 +890,8 @@ canSkipBase = strategy.position_size == 0 and not inLossCooldown
 plotshape(longSkipped and strategy.position_size != 0, "Skip: In pos", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="In position")
 plotshape(longSkipped and canSkipBase and inLossCooldown, "Skip: Loss CD L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Cooldown")
 plotshape(longSkipped and canSkipBase and not inLossCooldown and inSameDirCooldownLong, "Skip: Same dir CD L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Re-entry CD")
-plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
+plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and lossStreakPauseActive and not ghostActive, "Skip: Paused L", shape.xcross, location.abovebar, color.new(color.red, 0), size=size.tiny, display=display.all - display.status_line, text="Paused")
+plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not lossStreakPauseActive and oneTradePerDay and tradedToday, "Skip: 1/day", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
 plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not beforeEntryCutoff, "Skip: Cutoff", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="After cutoff")
 plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and not afterEntryStart, "Skip: Early L", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Before 10am")
 plotshape(longSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownLong and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait", shape.xcross, location.abovebar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wait for OR")
@@ -776,7 +905,8 @@ plotshape(longFilterSkip and canSkipBase and not inSameDirCooldownLong and befor
 plotshape(shortSkipped and strategy.position_size != 0, "Skip: In pos S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="In position")
 plotshape(shortSkipped and canSkipBase and inLossCooldown, "Skip: Loss CD S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Cooldown")
 plotshape(shortSkipped and canSkipBase and not inLossCooldown and inSameDirCooldownShort, "Skip: Same dir CD S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Re-entry CD")
-plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
+plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and lossStreakPauseActive and not ghostActive, "Skip: Paused S", shape.xcross, location.belowbar, color.new(color.red, 0), size=size.tiny, display=display.all - display.status_line, text="Paused")
+plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not lossStreakPauseActive and oneTradePerDay and tradedToday, "Skip: 1/day S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="1 trade/day")
 plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not beforeEntryCutoff, "Skip: Cutoff S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="After cutoff")
 plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and not afterEntryStart, "Skip: Early S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Before 10am")
 plotshape(shortSkipped and canSkipBase and not inLossCooldown and not inSameDirCooldownShort and afterEntryStart and waitForOr and not afterOrPeriod, "Skip: OR wait S", shape.xcross, location.belowbar, color.new(color.orange, 0), size=size.tiny, display=display.all - display.status_line, text="Wait for OR")
